@@ -1,0 +1,21 @@
+name: franka-golf
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - stable-baselines3==2.3.2
+      - gymnasium==0.28.1
+      - torch>=2.0.0
+      - numpy
+      - matplotlib
+      - pandas
+      - tensorboard
+      - tqdm
+      - mujoco==2.3.7
+      - glfw
+      - imageio
+      - imageio-ffmpeg
+      - pre-commit
