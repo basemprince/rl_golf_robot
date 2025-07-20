@@ -1,10 +1,11 @@
-"""Reinforcement learning training script for Franka robot golf task with curriculum learning."""
+"""Video recording utility for Franka robot reinforcement learning training."""
 
 import csv
 import os
 
 import gymnasium as gym
 import numpy as np
+from gymnasium.utils.save_video import save_video
 from sai_rl import SAIClient
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
@@ -64,10 +65,9 @@ class CurriculumWrapper(gym.Wrapper):
             if new_stage != self.current_stage:
                 self.current_stage = new_stage
                 self._apply_difficulty()
-                print(
-                    f"➡ Curriculum: Stage {self.current_stage} | "
-                    f"Difficulty={self.stages[self.current_stage]['difficulty']}"
-                )
+                stage_msg = f"➡ Curriculum: Stage {self.current_stage}"
+                diff_msg = f"Difficulty={self.stages[self.current_stage]['difficulty']}"
+                print(f"{stage_msg} | {diff_msg}")
 
     def _apply_difficulty(self):
         if hasattr(self.env, "set_difficulty"):
@@ -106,6 +106,10 @@ class VideoRecorderCallback(BaseCallback):
         self.video_dir = video_dir
         os.makedirs(video_dir, exist_ok=True)
 
+        # Initializing starting indices for steps and episodes
+        self.step_starting_index = 0
+        self.episode_index = 0
+
     def _on_step(self) -> bool:
         """Check if it's time to record a video and trigger recording if needed."""
         if self.num_timesteps % self.video_freq == 0 and self.num_timesteps > 0:
@@ -113,40 +117,54 @@ class VideoRecorderCallback(BaseCallback):
         return True
 
     def record_video(self):
-        """Record a video of the agent's current performance."""
-        print(f"\nRecording video at step {self.num_timesteps}...")
+        """Record a video of the agent's current performance using gymnasium's save_video."""
+        print(f"\n🎥 Recording video at step {self.num_timesteps}...")
 
-        # Create evaluation environment
-        video_env = DummyVecEnv([make_env])
-        video_env = VecNormalize(video_env, training=False, norm_obs=True, norm_reward=False)
-
-        # Sync normalization stats
-        if hasattr(self.training_env, "obs_rms"):
-            video_env.obs_rms = self.training_env.obs_rms
-
+        local_env = make_env()  # Create a local environment for recording
         frames = []
-        obs = video_env.reset()
-        for _ in range(self.video_length):
-            action, _ = self.model.predict(obs, deterministic=True)
-            obs, _, dones, _ = video_env.step(action)
+        total_reward = 0
 
-            frame = video_env.envs[0].render()  # Gymnasium default returns RGB array
-            if frame is not None:
-                frames.append(np.array(frame))
-            if dones.any():
+        # Reset the environment
+        obs, _ = local_env.reset()
+
+        # Extract the FPS from the environment's metadata
+        fps = local_env.metadata.get("render_fps", 30)  # Default to 30 if no FPS is found in metadata
+        if fps != 30:
+            print(f"Using FPS from environment metadata: {fps}")
+        else:
+            print(f"Using default FPS: {fps}")
+
+        # Run the episode and capture frames
+        for _ in range(self.video_length):
+            action, _ = self.model.predict(obs.reshape(1, -1), deterministic=True)
+            obs, reward, terminated, truncated, _ = local_env.step(action)
+
+            # Capture the frame
+            frames.append(local_env.render())
+
+            total_reward += reward
+
+            # End the episode if done or truncated
+            if terminated or truncated:
                 break
 
-        # Save video explicitly setting FPS
-        if frames:
-            # Import here to avoid loading the module when not needed
-            # pylint: disable=import-outside-toplevel
-            from moviepy.editor import ImageSequenceClip
+        # Save the video after the episode ends, using the save_video function
+        save_video(
+            frames=frames,
+            video_folder=self.video_dir,
+            fps=fps,  # Use the FPS from metadata
+            step_starting_index=self.step_starting_index,
+            episode_index=self.episode_index,
+        )
 
-            clip = ImageSequenceClip(frames, fps=30)
-            clip.write_videofile(f"{self.video_dir}/step_{self.num_timesteps}-episode-0.mp4")
-            print(f"Video saved: {self.video_dir}/step_{self.num_timesteps}-episode-0.mp4")
-        else:
-            print("No frames captured!")
+        print(f"✅ Video saved: {self.video_dir}/step_{self.num_timesteps}.mp4 (Reward: {total_reward:.2f})")
+
+        # Update the indices for the next video
+        self.step_starting_index = self.num_timesteps + 1
+        self.episode_index += 1
+
+        # Close the environment after recording
+        local_env.close()
 
 
 # pylint: disable=too-few-public-methods
@@ -171,6 +189,7 @@ class DebugPolicyCallback(BaseCallback):
             self.debug_policy()
         return True
 
+    # pylint: disable=too-many-locals, too-many-branches
     def debug_policy(self):
         """Run policy debugging with normal and sign-flipped actions."""
         print(f"\n[DEBUG] Policy check at step {self.num_timesteps}...")
@@ -180,22 +199,37 @@ class DebugPolicyCallback(BaseCallback):
     def _run_test(self, sign_flip=False, label="Normal"):
         """Run a test rollout with optional action sign flipping for debugging."""
         print(f"\n--- {label} Rollout ---")
+        # Create a vectorized environment for compatibility with the model
         debug_env = DummyVecEnv([make_env])
         debug_env = VecNormalize(debug_env, training=False, norm_obs=True, norm_reward=False)
 
         if hasattr(self.training_env, "obs_rms"):
             debug_env.obs_rms = self.training_env.obs_rms
 
-        obs = debug_env.reset()
+        # Reset the environment - handle both return formats
+        reset_result = debug_env.reset()
+        if isinstance(reset_result, tuple) and len(reset_result) == 2:
+            obs, _ = reset_result
+        else:
+            obs = reset_result
+
         prev_reward = 0
         rewards, delta_rewards, actions = [], [], []
 
         for step in range(self.n_steps):
+            # Get action from policy
             action, _ = self.model.predict(obs, deterministic=True)
             if sign_flip:
                 action = -action
 
-            obs, reward, dones, _ = debug_env.step(action)
+            # Execute action - handle both return formats
+            step_result = debug_env.step(action)
+            if len(step_result) == 5:  # New Gym API: obs, reward, terminated, truncated, info
+                obs, reward, terminated, truncated, _ = step_result
+                done = terminated or truncated
+            else:  # Old Gym API: obs, reward, done, info
+                obs, reward, done, _ = step_result
+                terminated = done
 
             delta = reward[0] - prev_reward
             prev_reward = reward[0]
@@ -205,8 +239,18 @@ class DebugPolicyCallback(BaseCallback):
             delta_rewards.append(delta)
             actions.append(action[0].tolist())
 
-            if dones.any():
-                obs = debug_env.reset()
+            if isinstance(terminated, bool) and terminated:
+                reset_result = debug_env.reset()
+                if isinstance(reset_result, tuple):
+                    obs, _ = reset_result
+                else:
+                    obs = reset_result
+            elif hasattr(terminated, "any") and terminated.any():
+                reset_result = debug_env.reset()
+                if isinstance(reset_result, tuple):
+                    obs, _ = reset_result
+                else:
+                    obs = reset_result
 
         self._analyze_results(actions, delta_rewards, rewards, label)
 
@@ -233,11 +277,13 @@ class DebugPolicyCallback(BaseCallback):
             print(f"  Action[{i}] corr={corr:.3f} -> {status}")
 
 
-video_callback = VideoRecorderCallback(video_freq=5_000, video_length=500, video_dir=VIDEO_DIR)
+video_callback = VideoRecorderCallback(video_freq=2_000, video_length=500, video_dir=VIDEO_DIR)
 debug_callback = DebugPolicyCallback(debug_freq=5_000, n_steps=50)
 
 
+# Action space should match the environment's action space shape (7,)
 policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+
 model = PPO(
     "MlpPolicy",
     env,
