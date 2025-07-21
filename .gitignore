@@ -3,3 +3,6 @@
 logs/
 checkpoints/
 *.csv
+eval_logs/
+best_model/
+.mypy_cache/
