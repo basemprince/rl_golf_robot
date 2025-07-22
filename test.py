@@ -11,7 +11,7 @@ env = sai.make_env(render_mode="human")
 
 obs, info = env.reset()
 print("Observation shape:", obs.shape)
-
+print("unwrapped", env.spec)
 # Initialize virtual end-effector position
 ee_pos = np.array([0.0, 0.0, 0.0])
 
