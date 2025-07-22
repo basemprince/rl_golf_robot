@@ -44,6 +44,70 @@ VIDEO_DURATION = 15
 DISPLAY_LIVE = False
 
 
+# === DH parameters for Franka Panda ===
+DH_PARAMS = [
+    (0, 0.333, 0, None),  # Joint 1
+    (0, 0, -np.pi / 2, None),  # Joint 2
+    (0, 0.316, np.pi / 2, None),  # Joint 3
+    (0.0825, 0, np.pi / 2, None),  # Joint 4
+    (-0.0825, 0.384, -np.pi / 2, None),  # Joint 5
+    (0, 0, np.pi / 2, None),  # Joint 6
+    (0.088, 0, np.pi / 2, None),  # Joint 7
+    (0, 0.107, 0, 0),  # Flange
+    (0, 0.1034, 0, np.pi / 4),  # End effector
+]
+
+
+def dh_transform(a, d, alpha, theta):
+    """Compute DH transformation matrix for given parameters."""
+    return np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0, a],
+            [np.sin(theta) * np.cos(alpha), np.cos(theta) * np.cos(alpha), -np.sin(alpha), -d * np.sin(alpha)],
+            [np.sin(theta) * np.sin(alpha), np.cos(theta) * np.sin(alpha), np.cos(alpha), d * np.cos(alpha)],
+            [0, 0, 0, 1],
+        ]
+    )
+
+
+def compute_ee_position(joint_angles):
+    """Compute end-effector (x,y,z) from 7 joint angles using Panda's DH parameters."""
+    T = np.eye(4)  # pylint: disable=invalid-name
+    for i, (a, d, alpha, theta) in enumerate(DH_PARAMS):
+        if theta is None:
+            theta = joint_angles[i]
+        T = T @ dh_transform(a, d, alpha, theta)  # pylint: disable=invalid-name
+    return T[:3, 3]  # Extract position vector (x, y, z)
+
+
+def is_club_dropped(club_quat, club_pos, tilt_threshold_deg=60, height_threshold=0.05):
+    """Detect if the club has dropped using orientation + height.
+
+    Args:
+        club_quat: Quaternion [w, x, y, z]
+        club_pos: Club position [x, y, z]
+        tilt_threshold_deg: Max allowed tilt angle from vertical
+        height_threshold: Min allowed Z height before considering drop
+    """
+    w, x, y, z = club_quat
+    # Rotation matrix from quaternion
+    # pylint: disable=invalid-name
+    R = np.array(
+        [
+            [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x**2 + y**2)],
+        ]
+    )
+
+    z_axis = np.array([0, 0, 1])
+    club_up = R[:, 2]  # Local Z-axis in world frame
+    dot = np.dot(club_up, z_axis) / (np.linalg.norm(club_up) * np.linalg.norm(z_axis))
+    tilt_angle = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+
+    return tilt_angle > tilt_threshold_deg or club_pos[2] < height_threshold
+
+
 # ===============================
 # GOLF REWARD WRAPPER
 # ===============================
@@ -69,22 +133,24 @@ class GolfRewardWrapper(gym.Wrapper):
         self.global_step = 0
         self.prev_ball_to_hole = None
         self.prev_club_to_ball = None
+        self.prev_ee_to_club = None  # Now tracked based on FK
 
     def reset(self, **kwargs):
-        """Reset the environment and initialize distance tracking.
-
-        Args:
-            **kwargs: Keyword arguments passed to the wrapped environment's reset method
-
-        Returns:
-            tuple: (observation, info)
-        """
+        """Reset the environment and initialize distances."""
         obs, info = self.env.reset(**kwargs)
+
+        # Extract positions
         ball_pos, hole_pos, club_pos = obs[18:21], obs[28:31], obs[21:24]
+        ee_pos = compute_ee_position(obs[0:7])  # FK from 7 joint angles
+
+        # Initialize distances
         self.prev_ball_to_hole = np.linalg.norm(ball_pos - hole_pos)
         self.prev_club_to_ball = np.linalg.norm(club_pos - ball_pos)
+        self.prev_ee_to_club = np.linalg.norm(ee_pos - club_pos)
+
         return obs, info
 
+    # pylint: disable=too-many-locals
     def step(self, action):
         """Execute action and apply reward shaping.
 
@@ -102,19 +168,29 @@ class GolfRewardWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.global_step += 1
 
+        # Extract positions
         ball_pos, club_pos, hole_pos = obs[18:21], obs[21:24], obs[28:31]
+        club_quat = obs[24:28]
+        ee_pos = compute_ee_position(obs[0:7])  # Compute FK each step
+
+        # Distances
         dist_ball_to_hole = np.linalg.norm(ball_pos - hole_pos)
         dist_club_to_ball = np.linalg.norm(club_pos - ball_pos)
+        dist_ee_to_club = np.linalg.norm(ee_pos - club_pos)
 
+        # Reward shaping
         shaped_reward = 0.0
-        # Encourage club moving toward ball
+        if dist_ee_to_club < self.prev_ee_to_club:
+            shaped_reward += 0.5  # Reward for EE moving closer to club
+        else:
+            shaped_reward -= 0.1  # Penalty for moving away
+
         if dist_club_to_ball < self.prev_club_to_ball:
             shaped_reward += 0.5
-        # Encourage ball progress toward hole
         if dist_ball_to_hole < self.prev_ball_to_hole:
             shaped_reward += 1.0
 
-        # Curriculum penalty for dropping club
+        # Curriculum-based penalty for dropping the club
         if self.global_step < 500_000:
             drop_penalty_scale = 0.0
         elif self.global_step < 1_500_000:
@@ -122,18 +198,23 @@ class GolfRewardWrapper(gym.Wrapper):
         else:
             drop_penalty_scale = 1.0
 
-        if "club_dropped" in info and info["club_dropped"]:
-            shaped_reward -= 2.0 * drop_penalty_scale
+        if is_club_dropped(club_quat, club_pos):
+            shaped_reward += 2.0 * (1 - drop_penalty_scale)
 
         reward += shaped_reward
 
+        # Update distances for next step
         self.prev_ball_to_hole = dist_ball_to_hole
         self.prev_club_to_ball = dist_club_to_ball
+        self.prev_ee_to_club = dist_ee_to_club
 
+        # Add extra info for logging
         info.update(
             {
                 "dist_ball_to_hole": dist_ball_to_hole,
                 "dist_club_to_ball": dist_club_to_ball,
+                "dist_ee_to_club": dist_ee_to_club,
+                "ee_position": ee_pos.tolist(),
                 "shaped_reward": shaped_reward,
                 "curriculum_scale": drop_penalty_scale,
             }
@@ -145,6 +226,7 @@ class GolfRewardWrapper(gym.Wrapper):
 # ===============================
 # VIDEO RECORDING
 # ===============================
+# pylint: disable=too-many-locals
 def record_video(filename, duration=15, display_live=False):
     """Record a video of the agent's performance.
 
@@ -170,9 +252,20 @@ def record_video(filename, duration=15, display_live=False):
         if done:
             break
         action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, _, _ = raw_env.step(action)
+        obs, reward, done, _, _ = raw_env.step(action)
         frame = raw_env.render()
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Convert observations to a string to display
+        chunks = [obs[0:10], obs[10:20], obs[20:31]]
+        obs_text = "\n".join([" ".join([f"{val:.2f}" for val in chunk]) for chunk in chunks])
+
+        reward_text = f"Reward: {reward:.2f}"
+
+        # Add the observation and reward text to the frame
+        cv2.putText(frame_bgr, obs_text, (10, h - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(frame_bgr, reward_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+
         out.write(frame_bgr)
 
         if display_live:
@@ -212,9 +305,14 @@ class VideoRecordingCallback(BaseCallback):
         super().__init__()
         self.n_steps = n_steps
         self.model = model
-        self.video_dir = video_dir
+        self.base_video_dir = video_dir
         self.duration = duration
         self.display_live = display_live
+
+        # Create a new folder (e.g., PPO1, PPO2, ...) based on existing directories
+        run_number = len([d for d in os.listdir(self.base_video_dir) if d.startswith("PPO")]) + 1
+        self.video_dir = os.path.join(self.base_video_dir, f"PPO{run_number}")
+        os.makedirs(self.video_dir, exist_ok=True)  # Create the new run folder
 
     def _on_step(self):
         """Check if it's time to record a video and trigger recording if needed.
@@ -285,6 +383,8 @@ class TensorboardMetricsCallback(BaseCallback):
         if "dist_ball_to_hole" in info:
             self.logger.record("custom/dist_ball_to_hole", info["dist_ball_to_hole"])
             self.logger.record("custom/dist_club_to_ball", info["dist_club_to_ball"])
+            self.logger.record("custom/dist_ee_to_club", info["dist_ee_to_club"])
+            self.logger.record("custom/ee_position", info["ee_position"])
             self.logger.record("custom/shaped_reward", info["shaped_reward"])
             self.logger.record("custom/curriculum_scale", info["curriculum_scale"])
         return True
@@ -311,19 +411,19 @@ eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0
 # ===============================
 # PPO CONFIG
 # ===============================
-policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}, "activation_fn": torch.nn.ReLU}
+policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
 
 model = PPO(
     "MlpPolicy",
     env,
     policy_kwargs=policy_kwargs,
-    learning_rate=lambda f: 3e-4 * f,
-    n_steps=2048,
-    batch_size=128,
+    learning_rate=lambda f: 1e-4 * f,
+    n_steps=4096,
+    batch_size=256,
     gamma=0.99,
     gae_lambda=0.95,
     clip_range=0.2,
-    ent_coef=0.05,
+    ent_coef=0.01,
     vf_coef=0.5,
     max_grad_norm=0.5,
     verbose=1,
