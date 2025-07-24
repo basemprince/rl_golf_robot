@@ -18,6 +18,11 @@ to hit a ball into a hole, requiring complex manipulation skills.
 
 import os
 
+# ===============================
+# CONFIG
+# ===============================
+from datetime import datetime
+
 import cv2
 import gymnasium as gym
 import numpy as np
@@ -29,17 +34,15 @@ from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.utils import get_linear_fn
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# ===============================
-# CONFIG
-# ===============================
-VIDEO_DIR = "./ppo_videos"
-LOG_DIR = "./ppo_logs"
-BEST_MODEL_DIR = "./best_model"
-CHECKPOINT_DIR = "./ppo_models"  # Directory for periodic saves
-os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(BEST_MODEL_DIR, exist_ok=True)
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+RUN_NAME = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+RUN_DIR = f"./runs/{RUN_NAME}"
+VIDEO_DIR = f"{RUN_DIR}/videos"
+LOG_DIR = f"{RUN_DIR}/tensorboard"
+BEST_MODEL_DIR = f"{RUN_DIR}/best_model"
+CHECKPOINT_DIR = f"{RUN_DIR}/models"
+
+for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
 
 TOTAL_TIMESTEPS = 3_000_000
 VIDEO_INTERVAL = 10_000
