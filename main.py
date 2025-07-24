@@ -26,6 +26,7 @@ from sai_rl import SAIClient
 from scipy.spatial.transform import Rotation as R
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.utils import get_linear_fn
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 # ===============================
@@ -34,13 +35,16 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 VIDEO_DIR = "./ppo_videos"
 LOG_DIR = "./ppo_logs"
 BEST_MODEL_DIR = "./best_model"
+CHECKPOINT_DIR = "./ppo_models"  # Directory for periodic saves
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 TOTAL_TIMESTEPS = 3_000_000
 VIDEO_INTERVAL = 10_000
 VIDEO_DURATION = 15
+CHECKPOINT_INTERVAL = 10_000
 DISPLAY_LIVE = False
 INCLUDE_VELOCITIES = True
 
@@ -566,6 +570,25 @@ class EntropySchedulerCallback(BaseCallback):  # pylint: disable=too-few-public-
         return True
 
 
+class CheckpointCallback(BaseCallback):
+    """Save model every N steps in incremental folders: PPO_1, PPO_2, etc."""
+
+    def __init__(self, save_freq, save_path):
+        super().__init__()
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.run_number = len([d for d in os.listdir(save_path) if d.startswith("PPO_")]) + 1
+        self.run_dir = os.path.join(save_path, f"PPO_{self.run_number}")
+        os.makedirs(self.run_dir, exist_ok=True)
+
+    def _on_step(self):
+        if self.num_timesteps % self.save_freq == 0:
+            save_file = os.path.join(self.run_dir, f"model_{self.num_timesteps}.zip")
+            self.model.save(save_file)
+            print(f"[INFO] Saved checkpoint at {save_file}")
+        return True
+
+
 class TensorboardMetricsCallback(BaseCallback):
     """Callback for logging custom metrics to TensorBoard.
 
@@ -596,59 +619,6 @@ class TensorboardMetricsCallback(BaseCallback):
         return True
 
 
-# ===============================
-# ENVIRONMENT SETUP
-# ===============================
-sai = SAIClient(comp_id="franka-ml-hiring")
-
-# Toggle for including velocities in observations
-
-
-# Training environment (NO rendering for speed)
-train_env = sai.make_env()  # Full env
-fk_solver = FrankaFK(train_env.spec)
-train_env = GolfRewardWrapper(train_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)  # Reward shaping
-train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
-env = DummyVecEnv([lambda: train_env])  # Vectorize
-env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
-
-
-# Evaluation environment
-eval_env = DummyVecEnv(
-    [
-        lambda: SimplifiedObservationWrapper(
-            GolfRewardWrapper(sai.make_env(), include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver),
-            include_velocities=INCLUDE_VELOCITIES,
-        )
-    ]
-)  # pylint: disable=unnecessary-lambda
-eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
-
-# ===============================
-# PPO CONFIG
-# ===============================
-# Define the observation dimension based on whether velocities are included
-OBS_DIM = 31  # Always use 31 dimensions for consistency
-policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
-
-model = PPO(
-    "MlpPolicy",
-    env,
-    policy_kwargs=policy_kwargs,
-    learning_rate=lambda f: 1e-3 * f,
-    n_steps=4096,  # Longer rollouts
-    batch_size=256,  # Keep mini-batch moderate
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_range=0.2,
-    ent_coef=0.05,  # Slightly more exploration
-    vf_coef=0.5,
-    max_grad_norm=0.5,
-    verbose=1,
-    tensorboard_log=LOG_DIR,
-)
-
-
 def make_raw_env(include_velocities=INCLUDE_VELOCITIES, fk_solver=None):  # pylint: disable=redefined-outer-name
     """Create a raw environment for video recording.
 
@@ -671,43 +641,91 @@ def make_raw_env(include_velocities=INCLUDE_VELOCITIES, fk_solver=None):  # pyli
 
 
 # ===============================
+# ENVIRONMENT SETUP
+# ===============================
+sai = SAIClient(comp_id="franka-ml-hiring")
+
+# Training environment (NO rendering for speed)
+train_env = sai.make_env()  # Full env
+fk_solver = FrankaFK(train_env.spec)
+train_env = GolfRewardWrapper(train_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)  # Reward shaping
+train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
+env = DummyVecEnv([lambda: train_env])  # Vectorize
+env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
+
+
+# Evaluation environment
+eval_env = DummyVecEnv(
+    [
+        lambda: SimplifiedObservationWrapper(
+            GolfRewardWrapper(sai.make_env(), include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver),
+            include_velocities=INCLUDE_VELOCITIES,
+        )
+    ]
+)  # pylint: disable=unnecessary-lambda
+eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
+
+# ===============================
+# PPO CONFIG (Optimized Hyperparameters + Schedulers)
+# ===============================
+policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
+# Schedulers for LR & Clip Range
+learning_rate_schedule = get_linear_fn(3e-4, 1e-5, TOTAL_TIMESTEPS)
+clip_range_schedule = get_linear_fn(0.2, 0.05, TOTAL_TIMESTEPS)
+
+model = PPO(
+    "MlpPolicy",
+    env,
+    policy_kwargs=policy_kwargs,
+    learning_rate=learning_rate_schedule,
+    n_steps=4096,
+    batch_size=256,
+    gamma=0.995,
+    gae_lambda=0.95,
+    clip_range=clip_range_schedule,
+    ent_coef=0.01,
+    vf_coef=0.5,
+    max_grad_norm=0.5,
+    use_sde=True,
+    sde_sample_freq=4,
+    normalize_advantage=True,
+    target_kl=0.01,
+    verbose=1,
+    tensorboard_log=LOG_DIR,
+)
+# ===============================
+# CALLBACKS
+# ===============================
+checkpoint_callback = CheckpointCallback(save_freq=CHECKPOINT_INTERVAL, save_path=CHECKPOINT_DIR)
+
+video_callback = VideoRecordingCallback(
+    VIDEO_INTERVAL,
+    model,
+    duration=VIDEO_DURATION,
+    display_live=DISPLAY_LIVE,
+    include_velocities=INCLUDE_VELOCITIES,
+    fk_solver=fk_solver,
+)
+
+eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
+entropy_callback = EntropySchedulerCallback()
+tb_callback = TensorboardMetricsCallback()
+
+
+# ===============================
 # TRAIN
 # ===============================
-# pylint: disable=redefined-outer-name
-def train(
-    total_timesteps=TOTAL_TIMESTEPS, display_live_video=False, include_velocities=INCLUDE_VELOCITIES, fk_solver=None
-):
-    """Train the PPO agent on the Franka golf task.
-
-    Sets up all callbacks and runs the training process for the specified number of timesteps.
-
-    Args:
-        total_timesteps: Total number of environment steps to train for
-        display_live_video: Whether to display videos in a window during recording
-        include_velocities: Whether to include joint velocities in observations
-    """
-
-    video_callback = VideoRecordingCallback(
-        VIDEO_INTERVAL,
-        model,
-        duration=VIDEO_DURATION,
-        display_live=display_live_video,
-        include_velocities=include_velocities,
-        fk_solver=fk_solver,
-    )
-    eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
-    entropy_callback = EntropySchedulerCallback()
-    tb_callback = TensorboardMetricsCallback()
-
+def train(total_timesteps=TOTAL_TIMESTEPS):
+    """Train the model with the specified total timesteps."""
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[video_callback, eval_callback, entropy_callback, tb_callback],
+        callback=[checkpoint_callback, video_callback, eval_callback, entropy_callback, tb_callback],
         progress_bar=True,
     )
     print("[INFO] Training completed!")
 
 
 if __name__ == "__main__":
-    train(display_live_video=DISPLAY_LIVE, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)
+    train(total_timesteps=TOTAL_TIMESTEPS)
     env.close()
     eval_env.close()
