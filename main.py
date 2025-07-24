@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from sai_rl import SAIClient
 from scipy.spatial.transform import Rotation as R
-from stable_baselines3 import A2C
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -41,8 +41,8 @@ os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 TOTAL_TIMESTEPS = 3_000_000
 VIDEO_INTERVAL = 10_000
 VIDEO_DURATION = 15
-DISPLAY_LIVE = True
-INCLUDE_VELOCITIES = False
+DISPLAY_LIVE = False
+INCLUDE_VELOCITIES = True
 
 
 def is_club_dropped(club_quat, club_pos, tilt_threshold_deg=60, height_threshold=0.05):
@@ -214,13 +214,13 @@ class GolfRewardWrapper(gym.Wrapper):
         # =========================
         # 1. EE → Club shaping
         # =========================
-        shaped_reward += 20 * progress_ee_to_club  # Positive for improvement, negative for regress
+        shaped_reward += 5 * progress_ee_to_club  # Positive for improvement, negative for regress
         shaped_reward += 2.0 / (dist_ee_to_club + 1e-6)  # Attraction term for staying close
 
         # =========================
         # 2. Club → Ball shaping
         # =========================
-        shaped_reward += 2 * progress_club_to_ball
+        shaped_reward += 10 * progress_club_to_ball
         shaped_reward += 1.0 / (dist_club_to_ball + 1e-6)
 
         # =========================
@@ -245,7 +245,8 @@ class GolfRewardWrapper(gym.Wrapper):
 
         # Final reward is shaped reward (we override sparse reward)
         old_reward = reward
-        reward += shaped_reward
+        # reward += shaped_reward
+        reward *= 2 - drop_penalty_scale
 
         # Update previous distances
         self.prev_ball_to_hole = dist_ball_to_hole
@@ -347,6 +348,37 @@ def simplify_obs(obs, include_velocities=False):
     return result
 
 
+def step_and_render_env(trained_model, obs, raw_env, include_velocities):
+    """Execute a model step and render the environment.
+
+    This function encapsulates the common pattern of predicting an action,
+    stepping the environment, rendering a frame, and simplifying observations.
+
+    Args:
+        trained_model: The trained model to use for prediction
+        obs: Current observation
+        raw_env: The environment to step and render
+        include_velocities: Whether to include velocities in observation simplification
+
+    Returns:
+        tuple: (new_obs, reward, done, frame_bgr, components)
+    """
+    # Predict action
+    action, _ = trained_model.predict(obs, deterministic=True)
+
+    # Step environment
+    obs, reward, done, _, _ = raw_env.step(action)
+
+    # Render frame
+    frame = raw_env.render()
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    # Get simplified observation with named components
+    components = simplify_obs(obs, include_velocities)
+
+    return obs, reward, done, frame_bgr, components
+
+
 # ===============================
 # VIDEO RECORDING
 # ===============================
@@ -378,13 +410,7 @@ def record_video(
         if done:
             break
         # Always use the raw observation for prediction to ensure consistent dimensions
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, _, _ = raw_env.step(action)
-        frame = raw_env.render()
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-        # Get simplified observation with named components
-        components = simplify_obs(obs, include_velocities)
+        obs, reward, done, frame_bgr, components = step_and_render_env(model, obs, raw_env, include_velocities)
 
         # Extract components directly from the dictionary
         joint_pos = components["joint_positions"]  # 7 DOF + 2 gripper joints
@@ -605,17 +631,17 @@ eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=3.0,
 OBS_DIM = 31  # Always use 31 dimensions for consistency
 policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
 
-model = A2C(
+model = PPO(
     "MlpPolicy",
     env,
     policy_kwargs=policy_kwargs,
-    learning_rate=lambda f: 3e-5 * f,
+    learning_rate=lambda f: 1e-3 * f,
     n_steps=4096,  # Longer rollouts
-    # batch_size=256,  # Keep mini-batch moderate
+    batch_size=256,  # Keep mini-batch moderate
     gamma=0.99,
     gae_lambda=0.95,
-    # clip_range=0.2,
-    ent_coef=0.02,  # Slightly more exploration
+    clip_range=0.2,
+    ent_coef=0.05,  # Slightly more exploration
     vf_coef=0.5,
     max_grad_norm=0.5,
     verbose=1,
@@ -669,9 +695,7 @@ def train(
         include_velocities=include_velocities,
         fk_solver=fk_solver,
     )
-    eval_callback = EvalCallback(
-        eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=50_000
-    )
+    eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
     entropy_callback = EntropySchedulerCallback()
     tb_callback = TensorboardMetricsCallback()
 

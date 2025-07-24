@@ -6,3 +6,6 @@ checkpoints/
 eval_logs/
 best_model/
 .mypy_cache/
+__pycache__/
+experiments/
+experiment_results/
