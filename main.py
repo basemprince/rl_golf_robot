@@ -17,6 +17,7 @@ to hit a ball into a hole, requiring complex manipulation skills.
 """
 
 import os
+import shutil
 
 # ===============================
 # CONFIG
@@ -26,7 +27,6 @@ from datetime import datetime
 import cv2
 import gymnasium as gym
 import numpy as np
-import torch
 from sai_rl import SAIClient
 from scipy.spatial.transform import Rotation as R
 from stable_baselines3 import PPO
@@ -43,6 +43,8 @@ CHECKPOINT_DIR = f"{RUN_DIR}/models"
 
 for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
+
+shutil.copy(__file__, f"{RUN_DIR}/main.py")
 
 TOTAL_TIMESTEPS = 3_000_000
 VIDEO_INTERVAL = 10_000
@@ -115,19 +117,31 @@ class FrankaFK:
             ]
         )
 
-    def compute_ee_position(self, joint_angles):
-        """Compute end-effector position in world frame."""
-        # FK in robot base frame
+    def compute_ee_pose(self, joint_angles):
+        """Compute end-effector position and orientation (rotation matrix) in world frame."""
+        # Forward kinematics in robot base frame
         # pylint: disable=invalid-name
         T = np.eye(4)
         for i, (a, d, alpha, theta) in enumerate(self.DH_PARAMS):
             if theta is None:
                 theta = joint_angles[i]
             T = T @ self.dh_transform(a, d, alpha, theta)  # pylint: disable=invalid-name
-        ee_in_base = T[:3, 3]
+
+        ee_in_base = T[:3, 3]  # Position in base frame
+        rot_in_base = T[:3, :3]  # Orientation as rotation matrix in base frame
 
         # Transform to world frame
-        return self.base_rot.apply(ee_in_base) + self.base_pos
+        ee_world = self.base_rot.apply(ee_in_base) + self.base_pos
+        rot_world = self.base_rot.as_matrix() @ rot_in_base  # Apply base rotation to orientation
+
+        return ee_world, rot_world
+
+    def rotation_to_rpy(self, rotation_matrix):
+        """Convert rotation matrix to roll, pitch, yaw (in radians)."""
+        roll = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+        pitch = np.arctan2(-rotation_matrix[2, 0], np.sqrt(rotation_matrix[2, 1] ** 2 + rotation_matrix[2, 2] ** 2))
+        yaw = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        return roll, pitch, yaw
 
 
 # ===============================
@@ -160,9 +174,29 @@ class GolfRewardWrapper(gym.Wrapper):
         self.include_velocities = include_velocities
         self.fk_solver = fk_solver
 
+    def compute_orientation_penalty(self, rotation_matrix, desired_roll=-1.5):
+        """Compute orientation penalty based on roll and pitch angles.
+
+        Args:
+            rotation_matrix: 3x3 rotation matrix
+            desired_roll: Target roll angle in radians
+
+        Returns:
+            tuple: (flatness_penalty, roll_penalty)
+        """
+        # Flatness penalty from pitch
+        roll, pitch, _ = fk_solver.rotation_to_rpy(rotation_matrix)
+        flatness_penalty = -abs(pitch)
+        roll_penalty = -abs(roll - desired_roll)
+
+        return flatness_penalty, roll_penalty
+
     def reset(self, **kwargs):
         """Reset the environment and initialize distances."""
-        obs, info = self.env.reset(**kwargs)
+        seed = np.random.randint(0, 1_000_000)
+        # print("supplied seed: ", kwargs["seed"], "generated seed: " , seed)
+        kwargs.pop("seed", None)
+        obs, info = self.env.reset(seed=seed, **kwargs)
 
         # Get simplified observation with named components
         components = simplify_obs(obs, self.include_velocities)
@@ -171,8 +205,7 @@ class GolfRewardWrapper(gym.Wrapper):
         ball_pos = components["ball_pos"]
         club_pos = components["club_pos"]
         hole_pos = components["hole_pos"]
-
-        ee_pos = self.fk_solver.compute_ee_position(obs[0:7])  # FK from 7 joint angles
+        ee_pos, _ = self.fk_solver.compute_ee_pose(obs[0:7])  # FK from 7 joint angles
 
         # Initialize distances
         self.prev_ball_to_hole = np.linalg.norm(ball_pos - hole_pos)
@@ -193,7 +226,6 @@ class GolfRewardWrapper(gym.Wrapper):
         """
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.global_step += 1
-
         # Get simplified observation with named components
         components = simplify_obs(obs, self.include_velocities)
 
@@ -203,7 +235,8 @@ class GolfRewardWrapper(gym.Wrapper):
         club_quat = components["club_quat"]
         hole_pos = components["hole_pos"]
 
-        ee_pos = self.fk_solver.compute_ee_position(obs[0:7])  # Forward kinematics for EE
+        ee_pos, ee_rot = self.fk_solver.compute_ee_pose(obs[0:7])  # Forward kinematics for EE
+        flatness_penalty, roll_penalty = self.compute_orientation_penalty(ee_rot)
 
         # Compute distances
         dist_ball_to_hole = np.linalg.norm(ball_pos - hole_pos)
@@ -218,17 +251,38 @@ class GolfRewardWrapper(gym.Wrapper):
         # Initialize shaped reward
         shaped_reward = 0.0
 
+        is_near = dist_ee_to_club < 0.03
+        gripper_closing = action[6] < -0.5  # Closing command
+        club_lifted = club_pos[2] > 0.2
+        club_stable = abs(club_pos[2] - self.prev_club_pos[2]) < 0.005 if hasattr(self, "prev_club_pos") else False
+
+        # =========================
+        # 4. Penalty for dropped club
+        # =========================
+
+        min_drop_height = 0.11
+        club_dropped = is_club_dropped(club_quat, club_pos, height_threshold=min_drop_height)
+        if club_dropped:  # Custom check based on quaternion
+            shaped_reward -= 40.0
+
         # =========================
         # 1. EE → Club shaping
         # =========================
-        shaped_reward += 5 * progress_ee_to_club  # Positive for improvement, negative for regress
-        shaped_reward += 2.0 / (dist_ee_to_club + 1e-6)  # Attraction term for staying close
+
+        if progress_ee_to_club > 0:
+            shaped_reward += 50 * progress_ee_to_club  # reward moving closer
+        else:
+            shaped_reward += 100 * progress_ee_to_club  # punish moving away harder
+        shaped_reward += 10 / (dist_ee_to_club + 1e-6)  # closeness bonus
+        # shaped_reward += (50 if self.global_step < 500_000 else 10) * progress_ee_to_club
+        # Positive for improvement, negative for regress
+        # shaped_reward += 2.0 / (dist_ee_to_club + 1e-6)  # Attraction term for staying close
 
         # =========================
         # 2. Club → Ball shaping
         # =========================
-        shaped_reward += 10 * progress_club_to_ball
-        shaped_reward += 1.0 / (dist_club_to_ball + 1e-6)
+        shaped_reward += 10 * progress_club_to_ball if not club_dropped and club_lifted else 0.0
+        shaped_reward += 1.0 / (dist_club_to_ball + 1e-6) if not club_dropped and club_lifted else 0.0
 
         # =========================
         # 3. Ball → Hole shaping
@@ -237,23 +291,28 @@ class GolfRewardWrapper(gym.Wrapper):
         shaped_reward += 1.0 / (dist_ball_to_hole + 1e-6)
 
         # =========================
-        # 4. Penalty for dropped club
+        # 5. Proxy Grasp Detection
         # =========================
-        if self.global_step < 500_000:
-            drop_penalty_scale = 0.0
-        elif self.global_step < 1_500_000:
-            drop_penalty_scale = 0.5
-        else:
-            drop_penalty_scale = 1.0
+        # Conditions: EE close to club, gripper closing, club lifted and stable
 
-        min_drop_height = 0.25
-        if is_club_dropped(club_quat, club_pos, height_threshold=min_drop_height):  # Custom check based on quaternion
-            shaped_reward += 2.0 * (1 - drop_penalty_scale)
+        if is_near and gripper_closing and club_lifted and club_stable:
+            shaped_reward += 100.0
+
+        # Additional reward for lifting the club after contact
+        if club_lifted:
+            shaped_reward += 5.0 * (club_pos[2] - 0.2)
+
+        # =========================
+        # 5. ee flatness penalty
+        # =========================
+        shaped_reward += 6.0 * flatness_penalty
+        shaped_reward += 5.0 * roll_penalty
 
         # Final reward is shaped reward (we override sparse reward)
         old_reward = reward
-        # reward += shaped_reward
-        reward *= 2 - drop_penalty_scale
+        reward *= 2 + shaped_reward
+        # reward *= 20
+        # reward = np.clip(reward, -30, 150)
 
         # Update previous distances
         self.prev_ball_to_hole = dist_ball_to_hole
@@ -271,7 +330,6 @@ class GolfRewardWrapper(gym.Wrapper):
                 "progress_ball_to_hole": progress_ball_to_hole,
                 "shaped_reward": shaped_reward,
                 "old_reward": old_reward,
-                "curriculum_scale": drop_penalty_scale,
             }
         )
 
@@ -345,7 +403,6 @@ def simplify_obs(obs, include_velocities=False):
     result["club_pos"] = club_pos
     result["club_quat"] = club_quat
     result["hole_pos"] = hole_pos
-
     # Also create the full simplified observation array for the model
     simplified_array = np.concatenate(
         [joint_positions, result["joint_velocities"], ball_pos, club_pos, club_quat, hole_pos]
@@ -405,7 +462,8 @@ def record_video(
         display_live: Whether to display the video in a window while recording
     """
     raw_env = make_raw_env(include_velocities=include_velocities, fk_solver=fk_solver)  # raw env without VecNormalize
-    obs, _ = raw_env.reset()
+    seed = np.random.randint(0, 1_000_000)
+    obs, _ = raw_env.reset(seed=seed)
     done = False
     frame_rate = 30
 
@@ -426,9 +484,10 @@ def record_video(
         club_quat = components["club_quat"]  # (w, x, y, z)
         hole_pos = components["hole_pos"]  # (x, y, z)
 
-        ee_pos = fk_solver.compute_ee_position(obs[0:7])  # First 7 are joint angles
+        ee_pos, ee_rot = fk_solver.compute_ee_pose(obs[0:7])  # First 7 are joint angles
+        roll, pitch, yaw = fk_solver.rotation_to_rpy(ee_rot)
         ee_text = f"EE Pos: {ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}"
-
+        rot_text = f"EE RPY: {roll:.3f}, {pitch:.3f}, {yaw:.3f}"
         # Format text with labels
         obs_text_lines = [
             f"Joint Pos: {' '.join([f'{val:.2f}' for val in joint_pos])}",
@@ -447,6 +506,7 @@ def record_video(
                 f"Club Ori:  {' '.join([f'{val:.2f}' for val in club_quat])}",
                 f"Hole Pos:  {' '.join([f'{val:.2f}' for val in hole_pos])}",
                 ee_text,
+                rot_text,
             ]
         )
 
@@ -514,10 +574,9 @@ class VideoRecordingCallback(BaseCallback):
         self.include_velocities = include_velocities
         self.fk_solver = fk_solver
 
-        # Create a new folder (e.g., PPO1, PPO2, ...) based on existing directories
-        run_number = len([d for d in os.listdir(self.base_video_dir) if d.startswith("PPO")]) + 1
-        self.video_dir = os.path.join(self.base_video_dir, f"PPO{run_number}")
-        os.makedirs(self.video_dir, exist_ok=True)  # Create the new run folder
+        # Videos will be saved directly in the video directory
+        self.video_dir = self.base_video_dir
+        os.makedirs(self.video_dir, exist_ok=True)
 
     def _on_step(self):
         """Check if it's time to record a video and trigger recording if needed.
@@ -574,19 +633,17 @@ class EntropySchedulerCallback(BaseCallback):  # pylint: disable=too-few-public-
 
 
 class CheckpointCallback(BaseCallback):
-    """Save model every N steps in incremental folders: PPO_1, PPO_2, etc."""
+    """Save model every N steps."""
 
     def __init__(self, save_freq, save_path):
         super().__init__()
         self.save_freq = save_freq
         self.save_path = save_path
-        self.run_number = len([d for d in os.listdir(save_path) if d.startswith("PPO_")]) + 1
-        self.run_dir = os.path.join(save_path, f"PPO_{self.run_number}")
-        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.save_path, exist_ok=True)
 
     def _on_step(self):
         if self.num_timesteps % self.save_freq == 0:
-            save_file = os.path.join(self.run_dir, f"model_{self.num_timesteps}.zip")
+            save_file = os.path.join(self.save_path, f"model_{self.num_timesteps}.zip")
             self.model.save(save_file)
             print(f"[INFO] Saved checkpoint at {save_file}")
         return True
@@ -618,7 +675,6 @@ class TensorboardMetricsCallback(BaseCallback):
             self.logger.record("custom/progress_ball_to_hole", info["progress_ball_to_hole"])
             self.logger.record("custom/shaped_reward", info["shaped_reward"])
             self.logger.record("custom/old_reward", info["old_reward"])
-            self.logger.record("custom/curriculum_scale", info["curriculum_scale"])
         return True
 
 
@@ -671,7 +727,8 @@ eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=3.0,
 # ===============================
 # PPO CONFIG (Optimized Hyperparameters + Schedulers)
 # ===============================
-policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
+policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+# policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
 # Schedulers for LR & Clip Range
 learning_rate_schedule = get_linear_fn(3e-4, 1e-5, TOTAL_TIMESTEPS)
 clip_range_schedule = get_linear_fn(0.2, 0.05, TOTAL_TIMESTEPS)
@@ -680,19 +737,19 @@ model = PPO(
     "MlpPolicy",
     env,
     policy_kwargs=policy_kwargs,
-    learning_rate=learning_rate_schedule,
+    learning_rate=learning_rate_schedule,  # keep your schedule
     n_steps=4096,
-    batch_size=256,
-    gamma=0.995,
+    batch_size=128,  # was 256
+    gamma=0.99,  # was 0.995
     gae_lambda=0.95,
-    clip_range=clip_range_schedule,
-    ent_coef=0.01,
+    clip_range=clip_range_schedule,  # keep your schedule
+    ent_coef=0.0001,  # was 0.01
     vf_coef=0.5,
     max_grad_norm=0.5,
-    use_sde=True,
+    use_sde=False,
     sde_sample_freq=4,
     normalize_advantage=True,
-    target_kl=0.01,
+    target_kl=None,  # disable premature stopping
     verbose=1,
     tensorboard_log=LOG_DIR,
 )
