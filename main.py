@@ -27,12 +27,17 @@ from datetime import datetime
 import cv2
 import gymnasium as gym
 import numpy as np
+import tensorflow as tf
+import torch
 from sai_rl import SAIClient
 from scipy.spatial.transform import Rotation as R
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.utils import get_linear_fn
+from stable_baselines3.common.logger import configure
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.utils import LinearSchedule
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from tensorboard.plugins.hparams import api as hp
 
 RUN_NAME = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 RUN_DIR = f"./runs/{RUN_NAME}"
@@ -41,10 +46,6 @@ LOG_DIR = f"{RUN_DIR}/tensorboard"
 BEST_MODEL_DIR = f"{RUN_DIR}/best_model"
 CHECKPOINT_DIR = f"{RUN_DIR}/models"
 
-for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
-    os.makedirs(dir_path, exist_ok=True)
-
-shutil.copy(__file__, f"{RUN_DIR}/main.py")
 
 TOTAL_TIMESTEPS = 3_000_000
 VIDEO_INTERVAL = 10_000
@@ -173,6 +174,7 @@ class GolfRewardWrapper(gym.Wrapper):
         self.prev_ee_to_club = None  # Now tracked based on FK
         self.include_velocities = include_velocities
         self.fk_solver = fk_solver
+        self.prev_action: np.ndarray = None
 
     def compute_orientation_penalty(self, rotation_matrix, desired_roll=-1.5):
         """Compute orientation penalty based on roll and pitch angles.
@@ -185,7 +187,7 @@ class GolfRewardWrapper(gym.Wrapper):
             tuple: (flatness_penalty, roll_penalty)
         """
         # Flatness penalty from pitch
-        roll, pitch, _ = fk_solver.rotation_to_rpy(rotation_matrix)
+        roll, pitch, _ = self.fk_solver.rotation_to_rpy(rotation_matrix)
         flatness_penalty = -abs(pitch)
         roll_penalty = -abs(roll - desired_roll)
 
@@ -214,7 +216,7 @@ class GolfRewardWrapper(gym.Wrapper):
 
         return obs, info
 
-    # pylint: disable=too-many-locals
+    # pylint: disable=too-many-locals,too-many-statements
     def step(self, action):
         """Execute action and apply improved reward shaping.
 
@@ -250,10 +252,12 @@ class GolfRewardWrapper(gym.Wrapper):
 
         # Initialize shaped reward
         shaped_reward = 0.0
+        gripper_width = obs[7]
 
         is_near = dist_ee_to_club < 0.03
-        gripper_closing = action[6] < -0.5  # Closing command
-        club_lifted = club_pos[2] > 0.2
+        is_grasping = 0.005 < gripper_width < 0.015
+
+        club_lifted = club_pos[2] > 0.14
         club_stable = abs(club_pos[2] - self.prev_club_pos[2]) < 0.005 if hasattr(self, "prev_club_pos") else False
 
         # =========================
@@ -262,8 +266,8 @@ class GolfRewardWrapper(gym.Wrapper):
 
         min_drop_height = 0.11
         club_dropped = is_club_dropped(club_quat, club_pos, height_threshold=min_drop_height)
-        if club_dropped:  # Custom check based on quaternion
-            shaped_reward -= 40.0
+        # if club_dropped:  # Custom check based on quaternion
+        #     shaped_reward -= 40.0
 
         # =========================
         # 1. EE → Club shaping
@@ -273,7 +277,7 @@ class GolfRewardWrapper(gym.Wrapper):
             shaped_reward += 50 * progress_ee_to_club  # reward moving closer
         else:
             shaped_reward += 100 * progress_ee_to_club  # punish moving away harder
-        shaped_reward += 10 / (dist_ee_to_club + 1e-6)  # closeness bonus
+        shaped_reward += 1 / (dist_ee_to_club + 1e-6)  # closeness bonus
         # shaped_reward += (50 if self.global_step < 500_000 else 10) * progress_ee_to_club
         # Positive for improvement, negative for regress
         # shaped_reward += 2.0 / (dist_ee_to_club + 1e-6)  # Attraction term for staying close
@@ -294,13 +298,13 @@ class GolfRewardWrapper(gym.Wrapper):
         # 5. Proxy Grasp Detection
         # =========================
         # Conditions: EE close to club, gripper closing, club lifted and stable
-
-        if is_near and gripper_closing and club_lifted and club_stable:
-            shaped_reward += 100.0
+        grasping_club = is_near and is_grasping and club_lifted and club_stable
+        if grasping_club:
+            shaped_reward += 10.0
 
         # Additional reward for lifting the club after contact
         if club_lifted:
-            shaped_reward += 5.0 * (club_pos[2] - 0.2)
+            shaped_reward += 5.0 * (club_pos[2] - 0.14)
 
         # =========================
         # 5. ee flatness penalty
@@ -308,9 +312,17 @@ class GolfRewardWrapper(gym.Wrapper):
         shaped_reward += 6.0 * flatness_penalty
         shaped_reward += 5.0 * roll_penalty
 
+        # === Acceleration Penalty ===
+        accel_penalty = 0.0
+        if hasattr(self, "prev_action"):
+            accel = np.linalg.norm(action - self.prev_action)
+            accel_penalty = -0.1 * accel  # scale penalty
+            shaped_reward += accel_penalty
+        self.prev_action = np.array(action)
+
         # Final reward is shaped reward (we override sparse reward)
         old_reward = reward
-        reward *= 2 + shaped_reward
+        # reward += shaped_reward
         # reward *= 20
         # reward = np.clip(reward, -30, 150)
 
@@ -318,6 +330,15 @@ class GolfRewardWrapper(gym.Wrapper):
         self.prev_ball_to_hole = dist_ball_to_hole
         self.prev_club_to_ball = dist_club_to_ball
         self.prev_ee_to_club = dist_ee_to_club
+
+        def normalize_inverse(x, max_val=1.0):
+            return max(0.0, min(max_val, 1.0 / (x + 1e-6)))
+
+        score = (
+            0.5 * normalize_inverse(dist_ball_to_hole, max_val=10.0)
+            + 0.3 * normalize_inverse(dist_club_to_ball, max_val=10.0)
+            + 0.2 * grasping_club
+        )
 
         # Info for logging
         info.update(
@@ -330,6 +351,7 @@ class GolfRewardWrapper(gym.Wrapper):
                 "progress_ball_to_hole": progress_ball_to_hole,
                 "shaped_reward": shaped_reward,
                 "old_reward": old_reward,
+                "composite_score": score,
             }
         )
 
@@ -446,9 +468,9 @@ def step_and_render_env(trained_model, obs, raw_env, include_velocities):
 # ===============================
 # VIDEO RECORDING
 # ===============================
-# pylint: disable=too-many-locals, redefined-outer-name
+# pylint: disable=too-many-locals, redefined-outer-name, too-many-arguments, too-many-positional-arguments
 def record_video(
-    filename, duration=15, display_live=False, include_velocities=False, fk_solver=None
+    filename, model, sai_client, duration=15, display_live=False, include_velocities=False, fk_solver=None
 ):  # pylint: disable=missing-function-docstring
     """Record a video of the agent's performance.
 
@@ -461,7 +483,9 @@ def record_video(
         duration: Duration of the video in seconds
         display_live: Whether to display the video in a window while recording
     """
-    raw_env = make_raw_env(include_velocities=include_velocities, fk_solver=fk_solver)  # raw env without VecNormalize
+    raw_env = make_raw_env(
+        sai_client, include_velocities=include_velocities, fk_solver=fk_solver
+    )  # raw env without VecNormalize
     seed = np.random.randint(0, 1_000_000)
     obs, _ = raw_env.reset(seed=seed)
     done = False
@@ -515,10 +539,10 @@ def record_video(
         # Add observation lines to frame
         y_offset = h - 140
         for line in obs_text_lines:
-            cv2.putText(frame_bgr, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(frame_bgr, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
             y_offset += 15
 
-        cv2.putText(frame_bgr, reward_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(frame_bgr, reward_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
         out.write(frame_bgr)
 
@@ -549,6 +573,7 @@ class VideoRecordingCallback(BaseCallback):
         self,
         n_steps,
         model,
+        sai_client,
         video_dir=VIDEO_DIR,
         duration=15,
         display_live=False,
@@ -568,6 +593,7 @@ class VideoRecordingCallback(BaseCallback):
         super().__init__()
         self.n_steps = n_steps
         self.model = model
+        self.sai_client = sai_client
         self.base_video_dir = video_dir
         self.duration = duration
         self.display_live = display_live
@@ -588,6 +614,8 @@ class VideoRecordingCallback(BaseCallback):
             filename = os.path.join(self.video_dir, f"video_{self.num_timesteps}_steps.mp4")
             record_video(
                 filename,
+                self.model,
+                self.sai_client,
                 duration=self.duration,
                 display_live=self.display_live,
                 include_velocities=self.include_velocities,
@@ -604,7 +632,7 @@ class EntropySchedulerCallback(BaseCallback):  # pylint: disable=too-few-public-
     to a final value over the course of training, balancing exploration and exploitation.
     """
 
-    def __init__(self, initial_ent=0.05, final_ent=0.005, total_steps=TOTAL_TIMESTEPS):
+    def __init__(self, initial_ent=0.02, final_ent=0.002, total_steps=TOTAL_TIMESTEPS):
         """Initialize the callback.
 
         Args:
@@ -650,21 +678,33 @@ class CheckpointCallback(BaseCallback):
 
 
 class TensorboardMetricsCallback(BaseCallback):
-    """Callback for logging custom metrics to TensorBoard.
+    """Callback for logging custom metrics and hyperparameters to TensorBoard.
 
     This callback extracts custom metrics from the environment info dictionary
     and logs them to TensorBoard for visualization and analysis.
     """
 
+    def __init__(self, log_dir, starting_learning_rate=None, starting_clip_range=None):
+        super().__init__()
+        self.hparams_logged = False
+        self.log_dir = log_dir
+        self.starting_learning_rate = starting_learning_rate
+        self.starting_clip_range = starting_clip_range
+
     def _on_step(self):
-        """Log custom metrics to TensorBoard.
+        """Log custom metrics and hyperparameters to TensorBoard.
 
         Extracts metrics from the environment info dictionary and logs them
-        to TensorBoard using the logger.
+        to TensorBoard using the logger. Also logs hyperparameters once.
 
         Returns:
             bool: Whether to continue training (always True in this case)
         """
+        # Log hyperparameters once at the start
+        if not self.hparams_logged:
+            self._log_hyperparameters()
+            self.hparams_logged = True
+
         info = self.locals.get("infos")[0]
         if "dist_ball_to_hole" in info:
             self.logger.record("custom/dist_ball_to_hole", info["dist_ball_to_hole"])
@@ -675,10 +715,32 @@ class TensorboardMetricsCallback(BaseCallback):
             self.logger.record("custom/progress_ball_to_hole", info["progress_ball_to_hole"])
             self.logger.record("custom/shaped_reward", info["shaped_reward"])
             self.logger.record("custom/old_reward", info["old_reward"])
+            self.logger.record("custom/composite_score", info["composite_score"])
         return True
 
+    def _log_hyperparameters(self):
+        """Log hyperparameters using TensorBoard HParams plugin."""
+        hparams = {
+            "learning_rate": self.starting_learning_rate,
+            "n_steps": self.model.n_steps,
+            "batch_size": self.model.batch_size,
+            "gamma": self.model.gamma,
+            "gae_lambda": self.model.gae_lambda,
+            "clip_range": self.starting_clip_range,
+            "ent_coef": self.model.ent_coef,
+            "vf_coef": self.model.vf_coef,
+            "max_grad_norm": self.model.max_grad_norm,
+            "target_kl": self.model.target_kl,
+            "include_velocities": INCLUDE_VELOCITIES,
+        }
 
-def make_raw_env(include_velocities=INCLUDE_VELOCITIES, fk_solver=None):  # pylint: disable=redefined-outer-name
+        with tf.summary.create_file_writer(self.log_dir).as_default():
+            hp.hparams(hparams, trial_id=RUN_NAME)
+
+
+def make_raw_env(
+    sai_client, include_velocities=INCLUDE_VELOCITIES, fk_solver=None
+):  # pylint: disable=redefined-outer-name
     """Create a raw environment for video recording.
 
     Creates an environment with rendering enabled and reward shaping applied,
@@ -690,7 +752,7 @@ def make_raw_env(include_velocities=INCLUDE_VELOCITIES, fk_solver=None):  # pyli
     Returns:
         gym.Env: A raw environment instance with rendering enabled
     """
-    raw_env = sai.make_env(render_mode="rgb_array")
+    raw_env = sai_client.make_env(render_mode="rgb_array")
     # Create a new FK solver if one wasn't provided
     if fk_solver is None:
         fk_solver = FrankaFK(raw_env.spec)
@@ -699,93 +761,106 @@ def make_raw_env(include_velocities=INCLUDE_VELOCITIES, fk_solver=None):  # pyli
     return raw_env
 
 
-# ===============================
-# ENVIRONMENT SETUP
-# ===============================
-sai = SAIClient(comp_id="franka-ml-hiring")
-
-# Training environment (NO rendering for speed)
-train_env = sai.make_env()  # Full env
-fk_solver = FrankaFK(train_env.spec)
-train_env = GolfRewardWrapper(train_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)  # Reward shaping
-train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
-env = DummyVecEnv([lambda: train_env])  # Vectorize
-env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
-
-
-# Evaluation environment
-eval_env = DummyVecEnv(
-    [
-        lambda: SimplifiedObservationWrapper(
-            GolfRewardWrapper(sai.make_env(), include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver),
-            include_velocities=INCLUDE_VELOCITIES,
-        )
-    ]
-)  # pylint: disable=unnecessary-lambda
-eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=3.0, clip_reward=10.0)
-
-# ===============================
-# PPO CONFIG (Optimized Hyperparameters + Schedulers)
-# ===============================
-policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
-# policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
-# Schedulers for LR & Clip Range
-learning_rate_schedule = get_linear_fn(3e-4, 1e-5, TOTAL_TIMESTEPS)
-clip_range_schedule = get_linear_fn(0.2, 0.05, TOTAL_TIMESTEPS)
-
-model = PPO(
-    "MlpPolicy",
-    env,
-    policy_kwargs=policy_kwargs,
-    learning_rate=learning_rate_schedule,  # keep your schedule
-    n_steps=4096,
-    batch_size=128,  # was 256
-    gamma=0.99,  # was 0.995
-    gae_lambda=0.95,
-    clip_range=clip_range_schedule,  # keep your schedule
-    ent_coef=0.0001,  # was 0.01
-    vf_coef=0.5,
-    max_grad_norm=0.5,
-    use_sde=False,
-    sde_sample_freq=4,
-    normalize_advantage=True,
-    target_kl=None,  # disable premature stopping
-    verbose=1,
-    tensorboard_log=LOG_DIR,
-)
-# ===============================
-# CALLBACKS
-# ===============================
-checkpoint_callback = CheckpointCallback(save_freq=CHECKPOINT_INTERVAL, save_path=CHECKPOINT_DIR)
-
-video_callback = VideoRecordingCallback(
-    VIDEO_INTERVAL,
-    model,
-    duration=VIDEO_DURATION,
-    display_live=DISPLAY_LIVE,
-    include_velocities=INCLUDE_VELOCITIES,
-    fk_solver=fk_solver,
-)
-
-eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
-entropy_callback = EntropySchedulerCallback()
-tb_callback = TensorboardMetricsCallback()
-
-
-# ===============================
-# TRAIN
-# ===============================
-def train(total_timesteps=TOTAL_TIMESTEPS):
-    """Train the model with the specified total timesteps."""
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=[checkpoint_callback, video_callback, eval_callback, entropy_callback, tb_callback],
-        progress_bar=True,
-    )
-    print("[INFO] Training completed!")
-
-
 if __name__ == "__main__":
+    # ===============================
+    # ENVIRONMENT SETUP
+    # ===============================
+    sai = SAIClient("FrankaIkGolfCourseEnv-v0")
+
+    # Training environment (NO rendering for speed)
+    train_env = sai.make_env()  # Full env
+    fk_solver = FrankaFK(train_env.spec)
+    train_env = GolfRewardWrapper(
+        train_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver
+    )  # Reward shaping
+    train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
+    env = DummyVecEnv([lambda: train_env])  # Vectorize
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+
+    eval_env = sai.make_env()
+    eval_env = GolfRewardWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)
+    eval_env = SimplifiedObservationWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES)
+    eval_env = Monitor(eval_env)
+    eval_env = DummyVecEnv([lambda: eval_env])  # Vectorize
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+
+    # ===============================
+    # PPO CONFIG (Optimized Hyperparameters + Schedulers)
+    # ===============================
+    # policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+
+    policy_kwargs = {"activation_fn": torch.nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+
+    #     policy_kwargs = dict(
+    #     net_arch=[dict(pi=[64, 64], vf=[64, 64])]
+    # )
+    # policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
+    # Schedulers for LR & Clip Range
+    STARTING_LEARNING_RATE = 1e-4
+    STARTING_CLIP_RANGE = 0.2
+    learning_rate_schedule = LinearSchedule(STARTING_LEARNING_RATE, 1e-5, TOTAL_TIMESTEPS)
+    clip_range_schedule = LinearSchedule(STARTING_CLIP_RANGE, 0.05, TOTAL_TIMESTEPS)
+
+    model = PPO(
+        "MlpPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=learning_rate_schedule,  # keep your schedule
+        n_steps=4096,
+        batch_size=512,  # was 256
+        gamma=0.995,  # was 0.995
+        gae_lambda=0.95,
+        clip_range=clip_range_schedule,  # keep your schedule
+        ent_coef=0.05,  # was 0.01
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        # use_sde=False,
+        # sde_sample_freq=4,
+        # normalize_advantage=True,
+        target_kl=0.02,  # disable premature stopping
+        verbose=1,
+        tensorboard_log=RUN_DIR,
+    )
+
+    # Override the logger to prevent PPO_1 subdirectory
+
+    model.set_logger(configure(LOG_DIR, ["tensorboard"]))
+    # ===============================
+    # CALLBACKS
+    # ===============================
+    checkpoint_callback = CheckpointCallback(save_freq=CHECKPOINT_INTERVAL, save_path=CHECKPOINT_DIR)
+
+    video_callback = VideoRecordingCallback(
+        VIDEO_INTERVAL,
+        model,
+        sai,
+        duration=VIDEO_DURATION,
+        display_live=DISPLAY_LIVE,
+        include_velocities=INCLUDE_VELOCITIES,
+        fk_solver=fk_solver,
+    )
+
+    eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
+    entropy_callback = EntropySchedulerCallback()
+    tb_callback = TensorboardMetricsCallback(LOG_DIR, STARTING_LEARNING_RATE, STARTING_CLIP_RANGE)
+
+    for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
+
+    shutil.copy(__file__, f"{RUN_DIR}/main.py")
+
+    # ===============================
+    # TRAIN
+    # ===============================
+    def train(total_timesteps=TOTAL_TIMESTEPS):
+        """Train the model with the specified total timesteps."""
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=[checkpoint_callback, video_callback, eval_callback, entropy_callback, tb_callback],
+            progress_bar=True,
+        )
+        print("[INFO] Training completed!")
+
     train(total_timesteps=TOTAL_TIMESTEPS)
     env.close()
     eval_env.close()

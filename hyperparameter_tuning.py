@@ -295,7 +295,11 @@ class ExperimentManager:
             final_ent=config.get("final_ent", 0.005),
             total_steps=total_timesteps,
         )
-        tb_callback = TensorboardMetricsCallback()
+        tb_callback = TensorboardMetricsCallback(
+            log_dir=exp_dir,
+            starting_learning_rate=config.get("learning_rate", 1e-3),
+            starting_clip_range=config.get("clip_range", 0.2),
+        )
 
         # Train model
         print(f"Starting experiment: {experiment_name}")
