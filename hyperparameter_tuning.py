@@ -9,24 +9,25 @@ configurations and track their performance metrics.
 import json
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from functools import partial
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from sai_rl import SAIClient
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from main import (
-    DummyVecEnv,
     EntropySchedulerCallback,
     FrankaFK,
     GolfRewardWrapper,
     SimplifiedObservationWrapper,
     TensorboardMetricsCallback,
-    sai,
 )
 
 
@@ -75,6 +76,7 @@ class MetricTrackingCallback(BaseCallback):
             "mean_dist_ball_to_hole": [],
             "mean_dist_club_to_ball": [],
             "success_rate": [],
+            "composite_score": [],
         }
 
     def _on_step(self):
@@ -91,6 +93,7 @@ class MetricTrackingCallback(BaseCallback):
         episode_rewards = []
         episode_ball_to_hole = []
         episode_club_to_ball = []
+        episode_composite_scores = []
         success_count = 0
         n_eval_episodes = 5
 
@@ -106,12 +109,16 @@ class MetricTrackingCallback(BaseCallback):
             if episode_data["club_to_ball"] is not None:
                 episode_club_to_ball.append(episode_data["club_to_ball"])
 
+            if episode_data["composite_score"] is not None:
+                episode_composite_scores.append(episode_data["composite_score"])
+
         return {
             "mean_reward": np.mean(episode_rewards),
             "std_reward": np.std(episode_rewards),
             "mean_ball_to_hole": np.mean(episode_ball_to_hole) if episode_ball_to_hole else float("nan"),
             "mean_club_to_ball": np.mean(episode_club_to_ball) if episode_club_to_ball else float("nan"),
             "success_rate": success_count / n_eval_episodes,
+            "composite_score": np.mean(episode_composite_scores) if episode_composite_scores else float("nan"),
         }
 
     def _run_single_episode(self):
@@ -121,6 +128,7 @@ class MetricTrackingCallback(BaseCallback):
         episode_reward = 0
         final_ball_to_hole = None
         final_club_to_ball = None
+        final_composite_score = None
 
         while not done:
             action = self._get_action(obs)
@@ -132,8 +140,15 @@ class MetricTrackingCallback(BaseCallback):
             if "dist_ball_to_hole" in info_dict:
                 final_ball_to_hole = info_dict["dist_ball_to_hole"]
                 final_club_to_ball = info_dict["dist_club_to_ball"]
+            if "composite_score" in info_dict:
+                final_composite_score = info_dict["composite_score"]
 
-        return {"reward": episode_reward, "ball_to_hole": final_ball_to_hole, "club_to_ball": final_club_to_ball}
+        return {
+            "reward": episode_reward,
+            "ball_to_hole": final_ball_to_hole,
+            "club_to_ball": final_club_to_ball,
+            "composite_score": final_composite_score,
+        }
 
     def _get_action(self, obs):
         """Get and format action from the model."""
@@ -177,6 +192,7 @@ class MetricTrackingCallback(BaseCallback):
         self.metrics["mean_dist_ball_to_hole"].append(metrics["mean_ball_to_hole"])
         self.metrics["mean_dist_club_to_ball"].append(metrics["mean_club_to_ball"])
         self.metrics["success_rate"].append(metrics["success_rate"])
+        self.metrics["composite_score"].append(metrics["composite_score"])
 
     def _log_metrics(self, metrics):
         """Log metrics to console."""
@@ -225,6 +241,7 @@ class ExperimentManager:
             json.dump(config, f, indent=2)
 
         # Setup environment
+        sai = SAIClient("FrankaIkGolfCourseEnv-v0")
         train_env = sai.make_env()
         fk_solver = FrankaFK(train_env.spec)
 
@@ -239,25 +256,21 @@ class ExperimentManager:
         env = VecNormalize(
             env,
             norm_obs=config.get("norm_obs", True),
-            norm_reward=config.get("norm_reward", True),
-            clip_obs=config.get("clip_obs", 3.0),
+            norm_reward=config.get("norm_reward", False),  # Match main.py
+            clip_obs=config.get("clip_obs", 5.0),  # Match main.py
             clip_reward=config.get("clip_reward", 10.0),
         )
 
         # Setup evaluation environment
-        eval_env = DummyVecEnv(
-            [
-                lambda: SimplifiedObservationWrapper(
-                    GolfRewardWrapper(sai.make_env(), include_velocities=include_velocities, fk_solver=fk_solver),
-                    include_velocities=include_velocities,
-                )
-            ]
-        )
+        eval_env = sai.make_env()
+        eval_env = GolfRewardWrapper(eval_env, include_velocities=include_velocities, fk_solver=fk_solver)
+        eval_env = SimplifiedObservationWrapper(eval_env, include_velocities=include_velocities)
+        eval_env = DummyVecEnv([lambda: eval_env])
         eval_env = VecNormalize(
             eval_env,
             norm_obs=config.get("norm_obs", True),
-            norm_reward=config.get("norm_reward", True),
-            clip_obs=config.get("clip_obs", 3.0),
+            norm_reward=config.get("norm_reward", False),  # Match main.py
+            clip_obs=config.get("clip_obs", 5.0),  # Match main.py
             clip_reward=config.get("clip_reward", 10.0),
         )
 
@@ -267,7 +280,7 @@ class ExperimentManager:
                 "pi": config.get("policy_network", [256, 256, 128]),
                 "vf": config.get("value_network", [256, 256, 128]),
             },
-            "activation_fn": torch.nn.ReLU,
+            "activation_fn": config.get("activation_fn", torch.nn.Tanh),  # Match main.py default
         }
 
         # Create model
@@ -343,6 +356,9 @@ class ExperimentManager:
                 if metric_callback.metrics["mean_dist_ball_to_hole"]
                 else None
             ),
+            "final_composite_score": (
+                metric_callback.metrics["composite_score"][-1] if metric_callback.metrics["composite_score"] else None
+            ),
         }
 
         self.results[experiment_name] = results
@@ -354,13 +370,14 @@ class ExperimentManager:
         return results
 
     # pylint: disable=redefined-outer-name
-    def run_grid_search(self, param_grid, base_config=None, total_timesteps=1_000_000):
+    def run_grid_search(self, param_grid, base_config=None, total_timesteps=1_000_000, n_jobs=1):
         """Run a grid search over hyperparameter combinations.
 
         Args:
             param_grid: Dictionary mapping parameter names to lists of values
             base_config: Base configuration to use for all experiments
             total_timesteps: Total timesteps to train for each experiment
+            n_jobs: Number of parallel jobs (1 for sequential)
 
         Returns:
             DataFrame containing results for all experiments
@@ -393,10 +410,24 @@ class ExperimentManager:
         print(f"Running grid search with {len(all_configs)} configurations")
 
         # Run each configuration
-        for i, config in enumerate(all_configs):
-            config_str = "_".join(f"{k}_{v}" for k, v in config.items() if k in param_grid)
-            experiment_name = f"grid_search_{i}_{config_str}"
-            self.run_experiment(config, experiment_name, total_timesteps)
+        if n_jobs == 1:
+            # Sequential execution
+            for i, config in enumerate(all_configs):
+                config_str = "_".join(f"{k}_{v}" for k, v in config.items() if k in param_grid)
+                experiment_name = f"grid_search_{i}_{config_str}"
+                self.run_experiment(config, experiment_name, total_timesteps)
+        else:
+            # Parallel execution
+            run_single_config = partial(
+                run_experiment_worker, base_dir=self.base_dir, total_timesteps=total_timesteps, grid_params=param_grid
+            )
+            with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                results = list(executor.map(run_single_config, enumerate(all_configs)))
+
+            # Store results
+            for result in results:
+                if result:
+                    self.results[result["experiment_name"]] = result
 
         # Compile results into DataFrame
         return self.get_results_dataframe()
@@ -414,6 +445,7 @@ class ExperimentManager:
                 "final_success_rate": result["final_success_rate"],
                 "final_mean_reward": result["final_mean_reward"],
                 "final_ball_to_hole": result["final_ball_to_hole"],
+                "final_composite_score": result.get("final_composite_score"),
             }
             # Add config parameters
             for k, v in result["config"].items():
@@ -490,8 +522,8 @@ if __name__ == "__main__":
         "max_grad_norm": 0.5,
         "include_velocities": False,
         "norm_obs": True,
-        "norm_reward": True,
-        "clip_obs": 3.0,
+        "norm_reward": False,  # Match main.py
+        "clip_obs": 5.0,  # Match main.py
         "clip_reward": 10.0,
         "policy_network": [256, 256, 128],
         "value_network": [256, 256, 128],
@@ -516,3 +548,13 @@ if __name__ == "__main__":
     # best_experiments = compare_experiments(manager)
     # print("Best experiments by final mean reward:")
     # print(best_experiments)
+
+
+def run_experiment_worker(config_tuple, base_dir, total_timesteps, grid_params):
+    """Worker function for parallel experiment execution."""
+    i, config = config_tuple
+    config_str = "_".join(f"{k}_{v}" for k, v in config.items() if k in grid_params)
+    experiment_name = f"grid_search_{i}_{config_str}"
+
+    exp_manager = ExperimentManager(base_dir)
+    return exp_manager.run_experiment(config, experiment_name, total_timesteps)

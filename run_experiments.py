@@ -33,8 +33,8 @@ def run_single_experiment():
         "max_grad_norm": 0.5,
         "include_velocities": True,  # Try with velocities
         "norm_obs": True,
-        "norm_reward": True,
-        "clip_obs": 3.0,
+        "norm_reward": False,  # Match main.py
+        "clip_obs": 5.0,  # Match main.py
         "clip_reward": 10.0,
         "policy_network": [256, 256, 128],
         "value_network": [256, 256, 128],
@@ -66,8 +66,8 @@ def run_learning_rate_search():
         "max_grad_norm": 0.5,
         "include_velocities": False,
         "norm_obs": True,
-        "norm_reward": True,
-        "clip_obs": 3.0,
+        "norm_reward": False,  # Match main.py
+        "clip_obs": 5.0,  # Match main.py
         "clip_reward": 10.0,
         "policy_network": [256, 256, 128],
         "value_network": [256, 256, 128],
@@ -79,9 +79,9 @@ def run_learning_rate_search():
     # Parameter grid
     param_grid = {"learning_rate": [1e-4, 3e-4, 1e-3, 3e-3]}
 
-    # Run grid search
+    # Run grid search with parallel execution
     results_df = manager.run_grid_search(
-        param_grid, base_config, total_timesteps=500_000  # Shorter training for grid search
+        param_grid, base_config, total_timesteps=500_000, n_jobs=4  # Use 4 parallel jobs
     )
 
     # Save results
@@ -115,8 +115,8 @@ def run_network_architecture_search():
         "max_grad_norm": 0.5,
         "include_velocities": False,
         "norm_obs": True,
-        "norm_reward": True,
-        "clip_obs": 3.0,
+        "norm_reward": False,  # Match main.py
+        "clip_obs": 5.0,  # Match main.py
         "clip_reward": 10.0,
         "initial_ent": 0.05,
         "final_ent": 0.005,
@@ -129,8 +129,8 @@ def run_network_architecture_search():
         "value_network": [[128, 128], [256, 256], [512, 256, 128], [256, 256, 256]],
     }
 
-    # Run grid search
-    results_df = manager.run_grid_search(param_grid, base_config, total_timesteps=500_000)
+    # Run grid search with parallel execution
+    results_df = manager.run_grid_search(param_grid, base_config, total_timesteps=300_000, n_jobs=4)
 
     # Save results
     results_df.to_csv("./experiment_results/network_architecture_search.csv", index=False)
@@ -152,8 +152,8 @@ def run_comprehensive_search():
         "max_grad_norm": 0.5,
         "include_velocities": False,
         "norm_obs": True,
-        "norm_reward": True,
-        "clip_obs": 3.0,
+        "norm_reward": False,  # Match main.py
+        "clip_obs": 5.0,  # Match main.py
         "clip_reward": 10.0,
         "policy_network": [256, 256, 128],
         "value_network": [256, 256, 128],
@@ -162,15 +162,16 @@ def run_comprehensive_search():
 
     # Parameter grid
     param_grid = {
-        "learning_rate": [1e-4, 3e-4],
-        "batch_size": [128, 256],
-        "ent_coef": [0.01, 0.05],
-        "initial_ent": [0.05, 0.1],
+        "learning_rate": [1e-4, 1e-5],
+        "batch_size": [64, 128, 256, 512],
+        "ent_coef": [0.02, 0.1],
+        "n_steps": [128, 512],
+        # "initial_ent": [0.05, 0.1],
     }
 
-    # Run grid search with shorter training time
+    # Run grid search with shorter training time and parallel execution
     results_df = manager.run_grid_search(
-        param_grid, base_config, total_timesteps=300_000  # Even shorter for comprehensive search
+        param_grid, base_config, total_timesteps=300_000, n_jobs=4  # Use 4 parallel jobs
     )
 
     # Save results

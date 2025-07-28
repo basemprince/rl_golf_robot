@@ -23,6 +23,7 @@ import shutil
 # CONFIG
 # ===============================
 from datetime import datetime
+from typing import Optional
 
 import cv2
 import gymnasium as gym
@@ -148,7 +149,7 @@ class FrankaFK:
 # ===============================
 # GOLF REWARD WRAPPER
 # ===============================
-class GolfRewardWrapper(gym.Wrapper):
+class GolfRewardWrapper(gym.Wrapper):  # pylint: disable=too-many-instance-attributes
     """Wrapper that shapes rewards to guide learning in the golf environment.
 
     This wrapper enhances the sparse reward signal from the environment by adding:
@@ -174,7 +175,8 @@ class GolfRewardWrapper(gym.Wrapper):
         self.prev_ee_to_club = None  # Now tracked based on FK
         self.include_velocities = include_velocities
         self.fk_solver = fk_solver
-        self.prev_action: np.ndarray = None
+        self.prev_action: Optional[np.ndarray] = None
+        self.prev_club_pos: Optional[np.ndarray] = None
 
     def compute_orientation_penalty(self, rotation_matrix, desired_roll=-1.5):
         """Compute orientation penalty based on roll and pitch angles.
@@ -213,7 +215,7 @@ class GolfRewardWrapper(gym.Wrapper):
         self.prev_ball_to_hole = np.linalg.norm(ball_pos - hole_pos)
         self.prev_club_to_ball = np.linalg.norm(club_pos - ball_pos)
         self.prev_ee_to_club = np.linalg.norm(ee_pos - club_pos)
-
+        self.prev_club_pos = club_pos.copy()
         return obs, info
 
     # pylint: disable=too-many-locals,too-many-statements
@@ -254,95 +256,95 @@ class GolfRewardWrapper(gym.Wrapper):
         shaped_reward = 0.0
         gripper_width = obs[7]
 
-        is_near = dist_ee_to_club < 0.03
+        is_near = dist_ee_to_club < 0.05
         is_grasping = 0.005 < gripper_width < 0.015
-
         club_lifted = club_pos[2] > 0.14
-        club_stable = abs(club_pos[2] - self.prev_club_pos[2]) < 0.005 if hasattr(self, "prev_club_pos") else False
+        club_stable = abs(club_pos[2] - self.prev_club_pos[2]) < 0.02 if self.prev_club_pos is not None else False
+
+        # === Curriculum Phase ===
+        if self.global_step < 500_000:  # Phase 1
+            grasp_weight, move_weight, hole_weight = 20.0, 0.0, 0.0
+            orientation_weight = 0.0
+            drop_penalty = 0.0
+        elif self.global_step < 1_500_000:  # Phase 2
+            grasp_weight, move_weight, hole_weight = 3.0, 3.0, 1.0
+            orientation_weight = 1.0
+            drop_penalty = -2.0
+        else:  # Phase 3
+            grasp_weight, move_weight, hole_weight = 1.0, 2.0, 5.0
+            orientation_weight = 2.0
+            drop_penalty = -10.0
 
         # =========================
-        # 4. Penalty for dropped club
+        # EE → Club shaping (Grasp Focus)
         # =========================
+        shaped_reward += grasp_weight * (0.5 * progress_ee_to_club)
+        shaped_reward += grasp_weight * (0.2 / (dist_ee_to_club + 1e-6))
 
-        min_drop_height = 0.11
-        club_dropped = is_club_dropped(club_quat, club_pos, height_threshold=min_drop_height)
-        # if club_dropped:  # Custom check based on quaternion
-        #     shaped_reward -= 40.0
-
-        # =========================
-        # 1. EE → Club shaping
-        # =========================
-
-        if progress_ee_to_club > 0:
-            shaped_reward += 50 * progress_ee_to_club  # reward moving closer
-        else:
-            shaped_reward += 100 * progress_ee_to_club  # punish moving away harder
-        shaped_reward += 1 / (dist_ee_to_club + 1e-6)  # closeness bonus
-        # shaped_reward += (50 if self.global_step < 500_000 else 10) * progress_ee_to_club
-        # Positive for improvement, negative for regress
-        # shaped_reward += 2.0 / (dist_ee_to_club + 1e-6)  # Attraction term for staying close
+        # Bonus for actually grasping
+        if is_near and is_grasping:
+            shaped_reward += grasp_weight * 10.0
+        if is_near and is_grasping and club_lifted and club_stable:
+            shaped_reward += grasp_weight * 20.0  # Big early boost
 
         # =========================
-        # 2. Club → Ball shaping
+        # Club → Ball shaping
         # =========================
-        shaped_reward += 10 * progress_club_to_ball if not club_dropped and club_lifted else 0.0
-        shaped_reward += 1.0 / (dist_club_to_ball + 1e-6) if not club_dropped and club_lifted else 0.0
+        if not is_club_dropped(club_quat, club_pos, height_threshold=0.11) and club_lifted:
+            shaped_reward += move_weight * (1.0 * progress_club_to_ball)
+            shaped_reward += move_weight * (0.1 / (dist_club_to_ball + 1e-6))
 
         # =========================
-        # 3. Ball → Hole shaping
+        # Ball → Hole shaping
         # =========================
-        shaped_reward += 3 * progress_ball_to_hole
-        shaped_reward += 1.0 / (dist_ball_to_hole + 1e-6)
+        shaped_reward += hole_weight * (1.0 * progress_ball_to_hole)
+        shaped_reward += hole_weight * (0.05 / (dist_ball_to_hole + 1e-6))
 
         # =========================
-        # 5. Proxy Grasp Detection
+        # Penalty for dropped club
         # =========================
-        # Conditions: EE close to club, gripper closing, club lifted and stable
-        grasping_club = is_near and is_grasping and club_lifted and club_stable
-        if grasping_club:
-            shaped_reward += 10.0
-
-        # Additional reward for lifting the club after contact
-        if club_lifted:
-            shaped_reward += 5.0 * (club_pos[2] - 0.14)
+        # Drop penalty (small early, bigger later)
+        # phase = min(1.0, self.global_step / 1_000_000)  # 0 → 1 over 1M steps
+        # drop_penalty = 2.0 - (12.0 * phase)  # Starts at +2, ends at -10
+        if is_club_dropped(club_quat, club_pos, height_threshold=0.11):
+            shaped_reward += drop_penalty
 
         # =========================
-        # 5. ee flatness penalty
+        # Flatness penalty only matters after grasping
         # =========================
-        shaped_reward += 6.0 * flatness_penalty
-        shaped_reward += 5.0 * roll_penalty
+        shaped_reward += orientation_weight * flatness_penalty
+        shaped_reward += orientation_weight * roll_penalty
 
         # === Acceleration Penalty ===
-        accel_penalty = 0.0
-        if hasattr(self, "prev_action"):
+        if self.prev_action is not None:
             accel = np.linalg.norm(action - self.prev_action)
-            accel_penalty = -0.1 * accel  # scale penalty
-            shaped_reward += accel_penalty
+            shaped_reward -= 0.01 * accel
         self.prev_action = np.array(action)
 
-        # Final reward is shaped reward (we override sparse reward)
+        # === Composite Score for Progress Tracking ===
+        def normalize_inverse(x, max_val=1.0):
+            return max(0.0, min(max_val, 1.0 / (x + 1e-6)))
+
+        composite_score = (
+            0.5 * normalize_inverse(dist_ball_to_hole, max_val=10.0)
+            + 0.3 * normalize_inverse(dist_club_to_ball, max_val=10.0)
+            + 0.2 * (1 if (is_near and is_grasping and club_lifted) else 0)
+        )
+
+        # === Final reward ===
         old_reward = reward
         # reward += shaped_reward
-        # reward *= 20
-        # reward = np.clip(reward, -30, 150)
 
         # Update previous distances
         self.prev_ball_to_hole = dist_ball_to_hole
         self.prev_club_to_ball = dist_club_to_ball
         self.prev_ee_to_club = dist_ee_to_club
-
-        def normalize_inverse(x, max_val=1.0):
-            return max(0.0, min(max_val, 1.0 / (x + 1e-6)))
-
-        score = (
-            0.5 * normalize_inverse(dist_ball_to_hole, max_val=10.0)
-            + 0.3 * normalize_inverse(dist_club_to_ball, max_val=10.0)
-            + 0.2 * grasping_club
-        )
+        self.prev_club_pos = club_pos
 
         # Info for logging
         info.update(
             {
+                "phase": 1 if self.global_step < 500_000 else (2 if self.global_step < 1_500_000 else 3),
                 "dist_ball_to_hole": dist_ball_to_hole,
                 "dist_club_to_ball": dist_club_to_ball,
                 "dist_ee_to_club": dist_ee_to_club,
@@ -351,7 +353,7 @@ class GolfRewardWrapper(gym.Wrapper):
                 "progress_ball_to_hole": progress_ball_to_hole,
                 "shaped_reward": shaped_reward,
                 "old_reward": old_reward,
-                "composite_score": score,
+                "composite_score": composite_score,
             }
         )
 
@@ -632,7 +634,7 @@ class EntropySchedulerCallback(BaseCallback):  # pylint: disable=too-few-public-
     to a final value over the course of training, balancing exploration and exploitation.
     """
 
-    def __init__(self, initial_ent=0.02, final_ent=0.002, total_steps=TOTAL_TIMESTEPS):
+    def __init__(self, initial_ent=0.1, final_ent=0.02, total_steps=TOTAL_TIMESTEPS):
         """Initialize the callback.
 
         Args:
@@ -730,7 +732,7 @@ class TensorboardMetricsCallback(BaseCallback):
             "ent_coef": self.model.ent_coef,
             "vf_coef": self.model.vf_coef,
             "max_grad_norm": self.model.max_grad_norm,
-            "target_kl": self.model.target_kl,
+            "target_kl": self.model.target_kl if self.model.target_kl is not None else 0.0,
             "include_velocities": INCLUDE_VELOCITIES,
         }
 
@@ -762,6 +764,11 @@ def make_raw_env(
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Check for model path argument
+    model_path = sys.argv[1] if len(sys.argv) > 1 else None
+
     # ===============================
     # ENVIRONMENT SETUP
     # ===============================
@@ -775,54 +782,48 @@ if __name__ == "__main__":
     )  # Reward shaping
     train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
     env = DummyVecEnv([lambda: train_env])  # Vectorize
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
 
     eval_env = sai.make_env()
     eval_env = GolfRewardWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)
     eval_env = SimplifiedObservationWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES)
     eval_env = Monitor(eval_env)
     eval_env = DummyVecEnv([lambda: eval_env])  # Vectorize
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
 
     # ===============================
-    # PPO CONFIG (Optimized Hyperparameters + Schedulers)
+    # MODEL SETUP
     # ===============================
-    # policy_kwargs = {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+    if model_path and os.path.exists(model_path):
+        print(f"Loading model from {model_path}")
+        model = PPO.load(model_path, env=env)
+    else:
+        print("Creating new model")
+        policy_kwargs = {"activation_fn": torch.nn.Tanh, "net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}}
+        STARTING_LEARNING_RATE = 3e-4
+        STARTING_CLIP_RANGE = 0.2
+        ENTROPY_START = 0.02
+        ENTROPY_END = 0.001
+        learning_rate_schedule = LinearSchedule(STARTING_LEARNING_RATE, 1e-5, TOTAL_TIMESTEPS)
+        clip_range_schedule = LinearSchedule(STARTING_CLIP_RANGE, 0.05, TOTAL_TIMESTEPS)
 
-    policy_kwargs = {"activation_fn": torch.nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}}
-
-    #     policy_kwargs = dict(
-    #     net_arch=[dict(pi=[64, 64], vf=[64, 64])]
-    # )
-    # policy_kwargs = {"net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}, "activation_fn": torch.nn.ReLU}
-    # Schedulers for LR & Clip Range
-    STARTING_LEARNING_RATE = 1e-4
-    STARTING_CLIP_RANGE = 0.2
-    learning_rate_schedule = LinearSchedule(STARTING_LEARNING_RATE, 1e-5, TOTAL_TIMESTEPS)
-    clip_range_schedule = LinearSchedule(STARTING_CLIP_RANGE, 0.05, TOTAL_TIMESTEPS)
-
-    model = PPO(
-        "MlpPolicy",
-        env,
-        policy_kwargs=policy_kwargs,
-        learning_rate=learning_rate_schedule,  # keep your schedule
-        n_steps=4096,
-        batch_size=512,  # was 256
-        gamma=0.995,  # was 0.995
-        gae_lambda=0.95,
-        clip_range=clip_range_schedule,  # keep your schedule
-        ent_coef=0.05,  # was 0.01
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        # use_sde=False,
-        # sde_sample_freq=4,
-        # normalize_advantage=True,
-        target_kl=0.02,  # disable premature stopping
-        verbose=1,
-        tensorboard_log=RUN_DIR,
-    )
-
-    # Override the logger to prevent PPO_1 subdirectory
+        model = PPO(
+            "MlpPolicy",
+            env,
+            policy_kwargs=policy_kwargs,
+            learning_rate=learning_rate_schedule,
+            n_steps=2048,
+            batch_size=64,
+            gamma=0.995,
+            gae_lambda=0.95,
+            clip_range=clip_range_schedule,
+            ent_coef=ENTROPY_START,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            target_kl=0.02,
+            verbose=1,
+            tensorboard_log=RUN_DIR,
+        )
 
     model.set_logger(configure(LOG_DIR, ["tensorboard"]))
     # ===============================
@@ -841,8 +842,8 @@ if __name__ == "__main__":
     )
 
     eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
-    entropy_callback = EntropySchedulerCallback()
-    tb_callback = TensorboardMetricsCallback(LOG_DIR, STARTING_LEARNING_RATE, STARTING_CLIP_RANGE)
+    entropy_callback = EntropySchedulerCallback(initial_ent=0.02, final_ent=0.001)
+    tb_callback = TensorboardMetricsCallback(LOG_DIR, 3e-4, 0.2)
 
     for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
         os.makedirs(dir_path, exist_ok=True)

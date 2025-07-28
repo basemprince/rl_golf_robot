@@ -14,9 +14,10 @@ import sys
 
 import cv2
 import numpy as np
+from sai_rl import SAIClient
 from stable_baselines3 import PPO
 
-from main import FrankaFK, GolfRewardWrapper, SimplifiedObservationWrapper, sai, step_and_render_env
+from main import FrankaFK, GolfRewardWrapper, SimplifiedObservationWrapper, step_and_render_env
 
 
 # pylint: disable=too-many-locals, redefined-outer-name
@@ -33,6 +34,7 @@ def play_model(model_path, num_episodes=10, video_duration=15, include_velocitie
     model = PPO.load(model_path)
 
     # Create environment for live display
+    sai = SAIClient("FrankaIkGolfCourseEnv-v0")
     raw_env = sai.make_env(render_mode="rgb_array")
     fk_solver = FrankaFK(raw_env.spec)
     raw_env = GolfRewardWrapper(raw_env, include_velocities=include_velocities, fk_solver=fk_solver)
@@ -113,7 +115,7 @@ if __name__ == "__main__":
 
     # Try to determine if model was trained with velocities by checking config
     config_path = os.path.join(os.path.dirname(model_path), "config.json")
-    INCLUDE_VELOCITIES = False
+    INCLUDE_VELOCITIES = True
 
     if os.path.exists(config_path):
         import json
