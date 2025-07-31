@@ -18,6 +18,7 @@ to hit a ball into a hole, requiring complex manipulation skills.
 
 import os
 import shutil
+import sys
 
 # ===============================
 # CONFIG
@@ -32,12 +33,12 @@ import tensorflow as tf
 import torch
 from sai_rl import SAIClient
 from scipy.spatial.transform import Rotation as R
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.utils import LinearSchedule
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.utils import get_linear_fn
+from stable_baselines3.common.vec_env import DummyVecEnv
 from tensorboard.plugins.hparams import api as hp
 
 RUN_NAME = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -54,6 +55,7 @@ VIDEO_DURATION = 15
 CHECKPOINT_INTERVAL = 10_000
 DISPLAY_LIVE = False
 INCLUDE_VELOCITIES = True
+ALGORITHM = "PPO"  # "PPO" or "SAC"
 
 
 def is_club_dropped(club_quat, club_pos, tilt_threshold_deg=60, height_threshold=0.05):
@@ -135,7 +137,7 @@ class FrankaFK:
         # Transform to world frame
         ee_world = self.base_rot.apply(ee_in_base) + self.base_pos
         rot_world = self.base_rot.as_matrix() @ rot_in_base  # Apply base rotation to orientation
-
+        ee_world[2] -= 0.129
         return ee_world, rot_world
 
     def rotation_to_rpy(self, rotation_matrix):
@@ -264,8 +266,8 @@ class GolfRewardWrapper(gym.Wrapper):  # pylint: disable=too-many-instance-attri
         # === Curriculum Phase ===
         if self.global_step < 500_000:  # Phase 1
             grasp_weight, move_weight, hole_weight = 20.0, 0.0, 0.0
-            orientation_weight = 0.0
-            drop_penalty = 0.0
+            orientation_weight = 1.0
+            drop_penalty = -0.5
         elif self.global_step < 1_500_000:  # Phase 2
             grasp_weight, move_weight, hole_weight = 3.0, 3.0, 1.0
             orientation_weight = 1.0
@@ -333,7 +335,13 @@ class GolfRewardWrapper(gym.Wrapper):  # pylint: disable=too-many-instance-attri
 
         # === Final reward ===
         old_reward = reward
-        # reward += shaped_reward
+
+        # Simple reward for debugging - uncomment to test
+        # reward = -dist_ee_to_club * 0.1  # Just move towards club
+        # if is_near and is_grasping:
+        #     reward += 1.0
+
+        reward += shaped_reward
 
         # Update previous distances
         self.prev_ball_to_hole = dist_ball_to_hole
@@ -686,10 +694,11 @@ class TensorboardMetricsCallback(BaseCallback):
     and logs them to TensorBoard for visualization and analysis.
     """
 
-    def __init__(self, log_dir, starting_learning_rate=None, starting_clip_range=None):
+    def __init__(self, log_dir, algorithm="PPO", starting_learning_rate=None, starting_clip_range=None):
         super().__init__()
         self.hparams_logged = False
         self.log_dir = log_dir
+        self.algorithm = algorithm
         self.starting_learning_rate = starting_learning_rate
         self.starting_clip_range = starting_clip_range
 
@@ -723,18 +732,36 @@ class TensorboardMetricsCallback(BaseCallback):
     def _log_hyperparameters(self):
         """Log hyperparameters using TensorBoard HParams plugin."""
         hparams = {
+            "algorithm": self.algorithm,
             "learning_rate": self.starting_learning_rate,
-            "n_steps": self.model.n_steps,
             "batch_size": self.model.batch_size,
             "gamma": self.model.gamma,
-            "gae_lambda": self.model.gae_lambda,
-            "clip_range": self.starting_clip_range,
-            "ent_coef": self.model.ent_coef,
-            "vf_coef": self.model.vf_coef,
-            "max_grad_norm": self.model.max_grad_norm,
-            "target_kl": self.model.target_kl if self.model.target_kl is not None else 0.0,
             "include_velocities": INCLUDE_VELOCITIES,
         }
+
+        # Add algorithm-specific hyperparameters
+        if self.algorithm == "PPO":
+            hparams.update(
+                {
+                    "n_steps": self.model.n_steps,
+                    "gae_lambda": self.model.gae_lambda,
+                    "clip_range": self.starting_clip_range,
+                    "vf_coef": self.model.vf_coef,
+                    "max_grad_norm": self.model.max_grad_norm,
+                    "target_kl": self.model.target_kl if self.model.target_kl is not None else 0.0,
+                }
+            )
+        elif self.algorithm == "SAC":
+            hparams.update(
+                {
+                    "buffer_size": self.model.buffer_size,
+                    "learning_starts": self.model.learning_starts,
+                    "train_freq": self.model.train_freq.frequency,
+                    "gradient_steps": self.model.gradient_steps,
+                }
+            )
+
+        hparams["ent_coef"] = self.model.ent_coef
 
         with tf.summary.create_file_writer(self.log_dir).as_default():
             hp.hparams(hparams, trial_id=RUN_NAME)
@@ -764,15 +791,22 @@ def make_raw_env(
 
 
 if __name__ == "__main__":
-    import sys
-
     # Check for model path argument
-    model_path = sys.argv[1] if len(sys.argv) > 1 else None
+    # model_path = sys.argv[1] if len(sys.argv) > 1 else None
+    model_path = None
+    bc_policy_path = None
+    args = sys.argv[1:]
+    if "-p" in args:
+        idx = args.index("-p")
+        model_path = args[idx + 1]
+    if "-b" in args:
+        idx = args.index("-b")
+        bc_policy_path = args[idx + 1]
 
     # ===============================
     # ENVIRONMENT SETUP
     # ===============================
-    sai = SAIClient("FrankaIkGolfCourseEnv-v0")
+    sai = SAIClient(comp_id="franka-ml-hiring")
 
     # Training environment (NO rendering for speed)
     train_env = sai.make_env()  # Full env
@@ -782,49 +816,72 @@ if __name__ == "__main__":
     )  # Reward shaping
     train_env = SimplifiedObservationWrapper(train_env, include_velocities=INCLUDE_VELOCITIES)  # Reduce obs size
     env = DummyVecEnv([lambda: train_env])  # Vectorize
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
+    # env = VecNormalize(env, norm_obs=False, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
 
     eval_env = sai.make_env()
     eval_env = GolfRewardWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES, fk_solver=fk_solver)
     eval_env = SimplifiedObservationWrapper(eval_env, include_velocities=INCLUDE_VELOCITIES)
     eval_env = Monitor(eval_env)
     eval_env = DummyVecEnv([lambda: eval_env])  # Vectorize
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
+    # eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
+
+    STARTING_LEARNING_RATE = 3e-4
+    STARTING_CLIP_RANGE = 0.2
+    ENTROPY_START = 0.01
+    ENTROPY_END = 0.001
+    policy_kwargs = {"activation_fn": torch.nn.ReLU, "net_arch": [256, 256]}
+    learning_rate_schedule = get_linear_fn(STARTING_LEARNING_RATE, 1e-4, TOTAL_TIMESTEPS)
 
     # ===============================
     # MODEL SETUP
     # ===============================
     if model_path and os.path.exists(model_path):
-        print(f"Loading model from {model_path}")
-        model = PPO.load(model_path, env=env)
+        print(f"[INFO] Loading full model from {model_path}")
+        if ALGORITHM == "PPO":
+            model = PPO.load(model_path, env=env)
+        else:
+            model = SAC.load(model_path, env=env)
     else:
-        print("Creating new model")
-        policy_kwargs = {"activation_fn": torch.nn.Tanh, "net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]}}
-        STARTING_LEARNING_RATE = 3e-4
-        STARTING_CLIP_RANGE = 0.2
-        ENTROPY_START = 0.02
-        ENTROPY_END = 0.001
-        learning_rate_schedule = LinearSchedule(STARTING_LEARNING_RATE, 1e-5, TOTAL_TIMESTEPS)
-        clip_range_schedule = LinearSchedule(STARTING_CLIP_RANGE, 0.05, TOTAL_TIMESTEPS)
+        print(f"[INFO] Creating new {ALGORITHM} model")
+        if ALGORITHM == "PPO":
+            clip_range_schedule = get_linear_fn(STARTING_CLIP_RANGE, 0.05, TOTAL_TIMESTEPS)
+            model = PPO(
+                "MlpPolicy",
+                env,
+                policy_kwargs=policy_kwargs,
+                learning_rate=learning_rate_schedule,
+                n_steps=2048,
+                batch_size=256,
+                gamma=0.99,
+                gae_lambda=0.95,
+                clip_range=clip_range_schedule,
+                ent_coef=ENTROPY_START,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                target_kl=0.01,
+                verbose=1,
+                tensorboard_log=RUN_DIR,
+            )
+        else:
+            model = SAC(
+                "MlpPolicy",
+                env,
+                policy_kwargs=policy_kwargs,
+                learning_rate=learning_rate_schedule,
+                batch_size=64,
+                gamma=0.995,
+                ent_coef=ENTROPY_START,
+                train_freq=1,
+                gradient_steps=1,
+                learning_starts=10_000,
+                buffer_size=1_000_000,
+                verbose=1,
+                tensorboard_log=RUN_DIR,
+            )
 
-        model = PPO(
-            "MlpPolicy",
-            env,
-            policy_kwargs=policy_kwargs,
-            learning_rate=learning_rate_schedule,
-            n_steps=2048,
-            batch_size=64,
-            gamma=0.995,
-            gae_lambda=0.95,
-            clip_range=clip_range_schedule,
-            ent_coef=ENTROPY_START,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            target_kl=0.02,
-            verbose=1,
-            tensorboard_log=RUN_DIR,
-        )
-
+        if bc_policy_path and os.path.exists(bc_policy_path):
+            print(f"[INFO] Initializing model with BC policy from {bc_policy_path}")
+            model.policy.load(bc_policy_path)
     model.set_logger(configure(LOG_DIR, ["tensorboard"]))
     # ===============================
     # CALLBACKS
@@ -842,8 +899,12 @@ if __name__ == "__main__":
     )
 
     eval_callback = EvalCallback(eval_env, best_model_save_path=BEST_MODEL_DIR, log_path="./eval_logs", eval_freq=5_000)
-    entropy_callback = EntropySchedulerCallback(initial_ent=0.02, final_ent=0.001)
-    tb_callback = TensorboardMetricsCallback(LOG_DIR, 3e-4, 0.2)
+    entropy_callback = (
+        EntropySchedulerCallback(initial_ent=ENTROPY_START, final_ent=ENTROPY_END) if ALGORITHM == "PPO" else None
+    )
+    tb_callback = TensorboardMetricsCallback(
+        LOG_DIR, ALGORITHM, STARTING_LEARNING_RATE, STARTING_CLIP_RANGE if ALGORITHM == "PPO" else None
+    )
 
     for dir_path in [VIDEO_DIR, LOG_DIR, BEST_MODEL_DIR, CHECKPOINT_DIR]:
         os.makedirs(dir_path, exist_ok=True)
@@ -855,9 +916,13 @@ if __name__ == "__main__":
     # ===============================
     def train(total_timesteps=TOTAL_TIMESTEPS):
         """Train the model with the specified total timesteps."""
+        callbacks = [checkpoint_callback, video_callback, eval_callback, tb_callback]
+        if entropy_callback is not None:
+            callbacks.append(entropy_callback)
+
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[checkpoint_callback, video_callback, eval_callback, entropy_callback, tb_callback],
+            callback=callbacks,
             progress_bar=True,
         )
         print("[INFO] Training completed!")

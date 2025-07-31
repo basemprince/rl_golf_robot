@@ -16,12 +16,13 @@ import cv2
 import numpy as np
 from sai_rl import SAIClient
 from stable_baselines3 import PPO
+from stable_baselines3.ppo import MlpPolicy
 
 from main import FrankaFK, GolfRewardWrapper, SimplifiedObservationWrapper, step_and_render_env
 
 
 # pylint: disable=too-many-locals, redefined-outer-name
-def play_model(model_path, num_episodes=10, video_duration=15, include_velocities=False):
+def play_model(model_path, bc_policy_path, num_episodes=10, video_duration=15, include_velocities=False):
     """Play a trained model live.
 
     Args:
@@ -30,8 +31,11 @@ def play_model(model_path, num_episodes=10, video_duration=15, include_velocitie
         video_duration: Duration of each episode in seconds
         include_velocities: Whether the model was trained with velocities
     """
+    if bc_policy_path is not None:
+        model = MlpPolicy.load(bc_policy_path)
     # Load the model
-    model = PPO.load(model_path)
+    else:
+        model = PPO.load(model_path)
 
     # Create environment for live display
     sai = SAIClient("FrankaIkGolfCourseEnv-v0")
@@ -102,30 +106,35 @@ def play_model(model_path, num_episodes=10, video_duration=15, include_velocitie
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python play_model.py <model_path>")
-        print("Example: python play_model.py ./experiments/best_experiment/final_model.zip")
-        sys.exit(1)
 
-    model_path = sys.argv[1]
+    model_path = None
+    bc_policy_path = None
+    args = sys.argv[1:]
+    if "-p" in args:
+        idx = args.index("-p")
+        model_path = args[idx + 1]
+    if "-b" in args:
+        idx = args.index("-b")
+        bc_policy_path = args[idx + 1]
 
-    if not os.path.exists(model_path):
+    if model_path and not os.path.exists(model_path):
         print(f"Error: Model file not found: {model_path}")
         sys.exit(1)
 
     # Try to determine if model was trained with velocities by checking config
-    config_path = os.path.join(os.path.dirname(model_path), "config.json")
+    # config_path = os.path.join(os.path.dirname(model_path), "config.json")
     INCLUDE_VELOCITIES = True
 
-    if os.path.exists(config_path):
-        import json
+    # if os.path.exists(config_path):
+    #     import json
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            INCLUDE_VELOCITIES = config.get("include_velocities", False)
-        print(f"Found config file. Using include_velocities={INCLUDE_VELOCITIES}")
-    else:
-        print("No config file found. Assuming include_velocities=False")
+    #     with open(config_path, "r", encoding="utf-8") as f:
+    #         config = json.load(f)
+    #         INCLUDE_VELOCITIES = config.get("include_velocities", False)
+    #     print(f"Found config file. Using include_velocities={INCLUDE_VELOCITIES}")
+    # else:
+    #     print("No config file found. Assuming include_velocities=False")
 
-    print("Controls: Press 'q' to quit, 'n' to skip to next episode")
-    play_model(model_path, num_episodes=10, include_velocities=INCLUDE_VELOCITIES)
+    # print("Controls: Press 'q' to quit, 'n' to skip to next episode")
+
+    play_model(model_path, bc_policy_path, num_episodes=10, include_velocities=INCLUDE_VELOCITIES)

@@ -10,3 +10,7 @@ __pycache__/
 experiments/
 experiment_results/
 runs/
+*.npz
+*.zip
+*.pkl
+.pylintrc

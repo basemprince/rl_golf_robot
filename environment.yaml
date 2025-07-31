@@ -19,3 +19,5 @@ dependencies:
       - tensorboard
       - tensorboard-data-server
       - tensorflow
+      - pre-commit
+      # - imitation

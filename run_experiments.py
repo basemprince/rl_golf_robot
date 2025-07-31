@@ -64,7 +64,7 @@ def run_learning_rate_search():
         "ent_coef": 0.05,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "include_velocities": False,
+        "include_velocities": True,
         "norm_obs": True,
         "norm_reward": False,  # Match main.py
         "clip_obs": 5.0,  # Match main.py
@@ -113,7 +113,7 @@ def run_network_architecture_search():
         "ent_coef": 0.05,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "include_velocities": False,
+        "include_velocities": True,
         "norm_obs": True,
         "norm_reward": False,  # Match main.py
         "clip_obs": 5.0,  # Match main.py
@@ -150,7 +150,7 @@ def run_comprehensive_search():
         "clip_range": 0.2,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "include_velocities": False,
+        "include_velocities": True,
         "norm_obs": True,
         "norm_reward": False,  # Match main.py
         "clip_obs": 5.0,  # Match main.py
